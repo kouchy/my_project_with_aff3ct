@@ -1,3 +1,7 @@
 [submodule "lib/aff3ct"]
 	path = lib/aff3ct
 	url = ../aff3ct.git
+[submodule "lib/pystreampu"]
+	path = lib/pystreampu
+	url = https://github.com/rtajan/pystreampu.git
+	branch = develop
