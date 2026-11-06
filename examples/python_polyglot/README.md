@@ -131,27 +131,35 @@ python pipeline_julia.py --sim-sequence -K 2048 -N 8192 -F 8 -t 4 -e 1000 -m 0.0
 
 ### 5.2. 5G NR / QC-LDPC Chain (`ldpc_5g_julia.py`)
 
-Equivalent to `examples/ldpc_5g_julia`, orchestrated from Python. It supports:
-- **Code families**: `--enc-type LDPC_5G` (3GPP 5G NR Base Graph 1 & 2) or `--enc-type LDPC_QC` (Quasi-Cyclic LDPC from `.qc` file via `--dec-h-path`)
-- **Decoders**:
-  - `--dec-implem SPA_JL` (or `--dec-jl`): `Stateful_Julia` Sum-Product Algorithm in `../ldpc_5g_julia/src/ldpc_bp_flooding_spa.jl`
-  - `-D BP_FLOODING --dec-implem SPA`: AFF3CT C++ Flooding SPA
-  - `-D BP_FLOODING --dec-implem MS`: AFF3CT C++ Flooding Min-Sum
-  - `-D BP_HORIZONTAL_LAYERED --dec-implem SPA`: AFF3CT C++ Layered SPA
-  - `-D BP_HORIZONTAL_LAYERED --dec-implem MS`: AFF3CT C++ Layered Min-Sum
-  - `-D BP_HORIZONTAL_LAYERED --dec-implem NMS`: AFF3CT C++ Layered Normalized Min-Sum
-  - `-D BP_HORIZONTAL_LAYERED --dec-implem OMS`: AFF3CT C++ Layered Offset Min-Sum
-  - `-D BP_FLOODING --dec-implem AMS`: AFF3CT C++ Flooding Approximate Min-Star
+Equivalent to `examples/ldpc_5g_julia`, orchestrated from Python. It supports a **generic, modular 4-axis LDPC decoder family** across C++ (`AFF3CT`), Julia (`Stateful_Julia` in `../ldpc_5g_julia/src/ldpc_bp_flooding_spa.jl`), and Python (`Stateful_core` in `ldpc_decoder_py.py` with Numba `@njit(nogil=True, fastmath=True)` and vectorized NumPy):
+- **Axis 1 — Scheduling (`-D` / `--dec-type`)**: `BP_FLOODING` (`BP-F`) or `BP_HORIZONTAL_LAYERED` (`BP-HL`)
+- **Axis 2 — Check-Node Update Rule (`--dec-implem`)**:
+  - **C++ (`AFF3CT`)**: `SPA`, `OMS` (plus `MS`, `NMS`, `LSPA`, `AMS`)
+  - **Julia (`Stateful_Julia`)**: `SPA_JL`, `OMS_JL` (or pass `--dec-jl` with `--dec-implem SPA|OMS`)
+  - **Python Numba (`@njit(nogil=True, fastmath=True)`)**: `SPA_PY_NUMBA`, `OMS_PY_NUMBA` (or pass `--dec-py NUMBA` with `--dec-implem SPA|OMS`)
+  - **Python NumPy**: `SPA_PY_NUMPY`, `OMS_PY_NUMPY` (or pass `--dec-py NUMPY` with `--dec-implem SPA|OMS`)
+- **Axis 3 — Representation (`-p` / `--sim-prec`)**:
+  - `-p 32`: 32-bit floating-point (`float` / `Float32` / `np.float32`)
+  - `-p 16`: 16-bit fixed-point (`int16_t` / `Int16` / `np.int16` with `Quantizer_pow2_fast_i16`, `--qnt-bits 8`, `--qnt-dec 2`, and symmetric saturation `[-sat_val, +sat_val]`)
+- **Axis 4 — Vectorization Strategy (`--dec-simd`)**:
+  - Scalar (intra-frame, default)
+  - `--dec-simd INTER`: inter-frame SIMD across $W = F$ frames per wave (`-F 8` for 32-bit, `-F 16` for 16-bit)
 - **Execution modes**: multi-threaded `Pipeline` (default) or multi-threaded `Sequence` (`--sim-sequence`)
 
 ```bash
-# Julia SIMD SPA decoder (--dec-implem SPA_JL) on 5G NR LDPC (K=512, N=1024, i=10) in Sequence mode:
-python ldpc_5g_julia.py --sim-sequence --enc-type LDPC_5G -K 512 -N 1024 -i 10 -F 8 -t 4 -e 100 -m 1.0 -M 2.5 -s 0.5 --dec-implem SPA_JL
+# 1. BP-Flooding + SPA (32-bit float, Scalar) across C++, Julia, and Python Numba:
+python ldpc_5g_julia.py --sim-sequence -K 512 -N 1024 -i 10 -F 1 -t 4 -e 100 -m 1.5 -M 2.5 -s 0.5 -D BP_FLOODING -p 32 --dec-implem SPA
+python ldpc_5g_julia.py --sim-sequence -K 512 -N 1024 -i 10 -F 1 -t 4 -e 100 -m 1.5 -M 2.5 -s 0.5 -D BP_FLOODING -p 32 --dec-implem SPA_JL
+python ldpc_5g_julia.py --sim-sequence -K 512 -N 1024 -i 10 -F 1 -t 4 -e 100 -m 1.5 -M 2.5 -s 0.5 -D BP_FLOODING -p 32 --dec-implem SPA_PY_NUMBA
 
-# C++ AFF3CT SPA decoder (--dec-implem SPA) on the exact same 5G NR LDPC code in Sequence mode:
-python ldpc_5g_julia.py --sim-sequence --enc-type LDPC_5G -K 512 -N 1024 -i 10 -F 8 -t 4 -e 100 -m 1.0 -M 2.5 -s 0.5 --dec-implem SPA
+# 2. BP-Horizontal-Layered + OMS (32-bit float, Inter-Frame SIMD W=8) across C++, Julia, and Python Numba:
+python ldpc_5g_julia.py --sim-sequence -K 512 -N 1024 -i 10 -F 8 --dec-simd INTER -t 4 -e 100 -m 1.5 -M 2.5 -s 0.5 -D BP_HORIZONTAL_LAYERED -p 32 --dec-implem OMS
+python ldpc_5g_julia.py --sim-sequence -K 512 -N 1024 -i 10 -F 8 --dec-simd INTER -t 4 -e 100 -m 1.5 -M 2.5 -s 0.5 -D BP_HORIZONTAL_LAYERED -p 32 --dec-implem OMS_JL
+python ldpc_5g_julia.py --sim-sequence -K 512 -N 1024 -i 10 -F 8 --dec-simd INTER -t 4 -e 100 -m 1.5 -M 2.5 -s 0.5 -D BP_HORIZONTAL_LAYERED -p 32 --dec-implem OMS_PY_NUMBA
 
-# Julia SIMD SPA decoder in 3-stage Pipeline mode:
-python ldpc_5g_julia.py --enc-type LDPC_5G -K 512 -N 1024 -i 10 -F 1 -t 4 -e 100 -m 1.0 -M 2.5 -s 0.5 --dec-implem SPA_JL
+# 3. BP-Horizontal-Layered + OMS (16-bit fixed-point Int16, Inter-Frame SIMD W=16) across C++, Julia, and Python Numba:
+python ldpc_5g_julia.py --sim-sequence -K 512 -N 1024 -i 10 -F 16 --dec-simd INTER -t 4 -e 100 -m 1.5 -M 2.5 -s 0.5 -D BP_HORIZONTAL_LAYERED -p 16 --dec-implem OMS
+python ldpc_5g_julia.py --sim-sequence -K 512 -N 1024 -i 10 -F 16 --dec-simd INTER -t 4 -e 100 -m 1.5 -M 2.5 -s 0.5 -D BP_HORIZONTAL_LAYERED -p 16 --dec-implem OMS_JL
+python ldpc_5g_julia.py --sim-sequence -K 512 -N 1024 -i 10 -F 16 --dec-simd INTER -t 4 -e 100 -m 1.5 -M 2.5 -s 0.5 -D BP_HORIZONTAL_LAYERED -p 16 --dec-implem OMS_PY_NUMBA
 ```
 

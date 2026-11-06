@@ -66,39 +66,28 @@ class DecoderRepetitionPython(spu.Stateful_core):
 
     @staticmethod
     def _decode_numpy(mdl, tsk, frame_id):
-        Y_N = tsk["Y_N"].numpy
-        V_K = tsk["V_K"].numpy
+        Y_N = tsk["Y_N"].wave
+        V_K = tsk["V_K"].wave
         K = mdl.K
         n_rep = mdl.rep_count + 1
-        if mdl.single_wave:
-            f_cnt = Y_N.shape[0]
-            if mdl.buffered:
-                acc = Y_N.reshape(f_cnt, n_rep, K).sum(axis=1)
-            else:
-                acc = Y_N.reshape(f_cnt, K, n_rep).sum(axis=2)
-            V_K[:] = (acc < 0.0).astype(np.int32)
+        f_cnt = Y_N.shape[0]
+        if mdl.buffered:
+            acc = Y_N.reshape(f_cnt, n_rep, K).sum(axis=1)
         else:
-            row = Y_N[frame_id]
-            if mdl.buffered:
-                acc = row.reshape(n_rep, K).sum(axis=0)
-            else:
-                acc = row.reshape(K, n_rep).sum(axis=1)
-            V_K[frame_id, :] = (acc < 0.0).astype(np.int32)
+            acc = Y_N.reshape(f_cnt, K, n_rep).sum(axis=2)
+        V_K[:] = (acc < 0.0).astype(np.int32)
         return 0
 
     @staticmethod
     def _decode_numba(mdl, tsk, frame_id):
-        Y_N = tsk["Y_N"].numpy
-        V_K = tsk["V_K"].numpy
-        if mdl.single_wave:
-            DecoderRepetitionPython._numba_kernel(Y_N, V_K, mdl.K, mdl.N, mdl.rep_count, 0, Y_N.shape[0])
-        else:
-            DecoderRepetitionPython._numba_kernel(Y_N, V_K, mdl.K, mdl.N, mdl.rep_count, frame_id, frame_id + 1)
+        Y_N = tsk["Y_N"].wave
+        V_K = tsk["V_K"].wave
+        DecoderRepetitionPython._numba_kernel(Y_N, V_K, mdl.K, mdl.N, mdl.rep_count, 0, Y_N.shape[0])
         return 0
 
     def clone(self):
         other = type(self).__new__(type(self))
-        spu.Stateful_core.__init__(other)
+        spu.Stateful_core.__init__(other, self)
         other.K = self.K
         other.N = self.N
         other.rep_count = self.rep_count

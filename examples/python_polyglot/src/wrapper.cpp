@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <fstream>
 #include <functional>
@@ -9,6 +10,7 @@
 #include <random>
 #include <sstream>
 #include <string>
+#include <tuple>
 #include <vector>
 
 #include <pybind11/numpy.h>
@@ -55,7 +57,8 @@ class Sigma_buffer
 };
 
 // Helper encapsulating an LDPC Sparse_matrix (from a .qc file or 5G NR standard)
-// together with its information bit positions, puncturing pattern, and Julia state constructors.
+// together with its information bit positions, puncturing pattern, CSR/CSC Tanner graph
+// arrays (for Python/Numba and Julia decoders), and 32-bit / 16-bit AFF3CT module builders.
 class LDPC_Code
 {
   private:
@@ -71,6 +74,14 @@ class LDPC_Code
     std::vector<uint32_t> info_bits_pos_;
     std::vector<bool> pct_pattern_;
     std::vector<uint32_t> h_cols_;
+    int16_t sat_val_i16_ = 0;
+
+    // 0-based CSR/CSC Tanner graph arrays for Python/Numba decoders
+    std::vector<int32_t> var_offsets_;
+    std::vector<int32_t> chk_offsets_;
+    std::vector<int32_t> transpose_;
+    std::vector<int32_t> chk_to_var_;
+    std::vector<int32_t> info_bits_pos_i32_;
 
     static std::string resolve_conf_file(const std::string& rel_path)
     {
@@ -88,6 +99,57 @@ class LDPC_Code
             if (f.good()) return p + rel_path;
         }
         return cli::modify_path<cli::Is_file>(rel_path);
+    }
+
+    void build_csr_arrays()
+    {
+        const int n_var = (int)this->H_.get_n_rows();
+        const int n_chk = (int)this->H_.get_n_cols();
+
+        std::vector<int32_t> var_degrees(n_var, 0);
+        this->chk_offsets_.resize(n_chk + 1);
+        this->chk_offsets_[0] = 0;
+
+        for (int c = 0; c < n_chk; c++)
+        {
+            const auto& col = this->H_.get_col_to_rows()[c];
+            const int32_t deg = (int32_t)col.size();
+            this->chk_offsets_[c + 1] = this->chk_offsets_[c] + deg;
+            for (int32_t idx = 0; idx < deg; idx++)
+            {
+                const int v = (int)col[idx];
+                var_degrees[v]++;
+            }
+        }
+
+        this->var_offsets_.resize(n_var + 1);
+        this->var_offsets_[0] = 0;
+        for (int v = 0; v < n_var; v++)
+            this->var_offsets_[v + 1] = this->var_offsets_[v] + var_degrees[v];
+
+        const int n_branches = (int)this->chk_offsets_.back();
+        this->transpose_.resize(n_branches);
+        this->chk_to_var_.resize(n_branches);
+        std::vector<int32_t> connections(n_var, 0);
+
+        int k = 0;
+        for (int c = 0; c < n_chk; c++)
+        {
+            const auto& col = this->H_.get_col_to_rows()[c];
+            for (size_t idx = 0; idx < col.size(); idx++)
+            {
+                const int v = (int)col[idx];
+                const int32_t branch_id = this->var_offsets_[v] + connections[v];
+                connections[v]++;
+                this->transpose_[k] = branch_id;
+                this->chk_to_var_[k] = (int32_t)v;
+                k++;
+            }
+        }
+
+        this->info_bits_pos_i32_.resize(this->K_);
+        for (int i = 0; i < this->K_; i++)
+            this->info_bits_pos_i32_[i] = (int32_t)this->info_bits_pos_[i];
     }
 
   public:
@@ -142,6 +204,11 @@ class LDPC_Code
             this->h_cols_.push_back((uint32_t)col.size());
             this->h_cols_.insert(this->h_cols_.end(), col.begin(), col.end());
         }
+
+        const int max_var_deg = std::max<int>(1, (int)this->H_.get_rows_max_degree());
+        this->sat_val_i16_ = (int16_t)((1 << ((sizeof(int16_t) * 8 - 2) - (int)std::log2(max_var_deg))) - 1);
+
+        this->build_csr_arrays();
     }
 
     int get_K() const { return this->K_; }
@@ -152,19 +219,47 @@ class LDPC_Code
     int get_n_connections() const { return (int)this->H_.get_n_connections(); }
     int get_cols_max_degree() const { return (int)this->H_.get_cols_max_degree(); }
     int get_rows_max_degree() const { return (int)this->H_.get_rows_max_degree(); }
+    int16_t get_sat_val_i16() const { return this->sat_val_i16_; }
     const std::string& get_qc_path() const { return this->qc_path_; }
 
     const aff3ct::tools::Sparse_matrix& get_H() const { return this->H_; }
     const std::vector<uint32_t>& get_info_bits_pos() const { return this->info_bits_pos_; }
     const std::vector<bool>& get_pct_pattern() const { return this->pct_pattern_; }
 
+    py::tuple get_tanner_graph_arrays() const
+    {
+        auto to_np = [](const std::vector<int32_t>& vec)
+        {
+            py::array_t<int32_t> arr(vec.size());
+            std::copy(vec.begin(), vec.end(), arr.mutable_data());
+            return arr;
+        };
+        return py::make_tuple(to_np(this->var_offsets_),
+                              to_np(this->chk_offsets_),
+                              to_np(this->transpose_),
+                              to_np(this->chk_to_var_),
+                              to_np(this->info_bits_pos_i32_));
+    }
+
     std::string get_julia_graph_ctor(const int n_ite = 20,
                                      const bool enable_syndrome = true,
-                                     const int syndrome_depth = 1) const
+                                     const int syndrome_depth = 1,
+                                     const std::string& dec_type = "BP_FLOODING",
+                                     const std::string& dec_implem = "SPA",
+                                     const std::string& q_type = "f32",
+                                     const float offset = 0.0f) const
     {
+        const bool is_i16 = (q_type == "i16" || q_type == "int16" || q_type == "Int16");
         std::stringstream ss;
         ss << "LDPC_Graph("
-           << "Int32(" << n_ite << "), "
+           << ":" << dec_type << ", "
+           << ":" << dec_implem << ", "
+           << (is_i16 ? "Int16" : "Float32") << ", ";
+        if (is_i16)
+            ss << "Int16(" << (int16_t)offset << "), Int16(" << this->sat_val_i16_ << "), ";
+        else
+            ss << "Float32(" << offset << "), Float32(0.0), ";
+        ss << "Int32(" << n_ite << "), "
            << (enable_syndrome ? "true" : "false") << ", "
            << "Int32(" << syndrome_depth << "), "
            << "Int32(" << this->H_.get_n_rows() << "), "
@@ -175,17 +270,25 @@ class LDPC_Code
         return ss.str();
     }
 
-    std::string get_julia_workspace_ctor() const
+    std::string get_julia_workspace_ctor(const std::string& simd_strategy = "",
+                                         const std::string& q_type = "f32",
+                                         const int n_frames_per_wave = 1) const
     {
+        const bool is_i16 = (q_type == "i16" || q_type == "int16" || q_type == "Int16");
+        const std::string mode_sym = (simd_strategy == "INTER") ? ":INTER" : ":SCALAR";
         std::stringstream ss;
         ss << "LDPC_Workspace("
+           << mode_sym << ", "
+           << (is_i16 ? "Int16" : "Float32") << ", "
            << "Int32(" << this->H_.get_n_rows() << "), "
            << "Int32(" << this->H_.get_n_connections() << "), "
-           << "Int32(" << this->H_.get_cols_max_degree() << ")"
+           << "Int32(" << this->H_.get_cols_max_degree() << "), "
+           << "Int32(" << std::max(1, n_frames_per_wave) << ")"
            << ")";
         return ss.str();
     }
 
+    // --- 32-bit (B = int, Q = float) builders ---
     aff3ct::module::Encoder_LDPC<int>* build_encoder() const
     {
         if (this->enc_type_ == "LDPC_5G")
@@ -230,10 +333,229 @@ class LDPC_Code
         dec_params.syndrome_depth = syndrome_depth;
         return dec_params.build<int, float>(this->H_, this->info_bits_pos_);
     }
+
+    // --- 16-bit (B = int16_t, Q = int16_t) builders ---
+    aff3ct::module::Encoder_LDPC<int16_t>* build_encoder_i16() const
+    {
+        if (this->enc_type_ == "LDPC_5G")
+        {
+            return new aff3ct::module::Encoder_LDPC_QC_fast<int16_t>(
+              this->K_, this->N_cw_, this->zc_, this->g_path_.c_str(), this->k_ldpc_);
+        }
+        return new aff3ct::module::Encoder_LDPC_from_QC<int16_t>(this->K_, this->N_cw_, this->H_);
+    }
+
+    aff3ct::module::Puncturer<int16_t, int16_t>* build_puncturer_i16() const
+    {
+        if (this->N_ != this->N_cw_)
+        {
+            if (this->enc_type_ == "LDPC_5G")
+                return new aff3ct::module::Puncturer_5G<int16_t, int16_t>(this->K_, this->N_, this->N_cw_, this->pct_pattern_);
+            if (!this->pct_pattern_.empty())
+                return new aff3ct::module::Puncturer_LDPC<int16_t, int16_t>(this->K_, this->N_, this->N_cw_, this->pct_pattern_);
+        }
+        return new aff3ct::module::Puncturer_NO<int16_t, int16_t>(this->K_, this->N_cw_);
+    }
+
+    aff3ct::module::Quantizer_pow2_fast<float, int16_t>* build_quantizer_i16(const short n_decimals = 2,
+                                                                             const short n_bits = 8) const
+    {
+        return new aff3ct::module::Quantizer_pow2_fast<float, int16_t>(this->N_, n_decimals, n_bits);
+    }
+
+    aff3ct::module::Decoder_SIHO<int16_t, int16_t>* build_decoder_i16(const std::string& type = "BP_FLOODING",
+                                                                      const std::string& implem = "OMS",
+                                                                      const int n_ite = 20,
+                                                                      const std::string& simd_strategy = "",
+                                                                      const float offset = 1.0f,
+                                                                      const float norm_factor = 1.0f,
+                                                                      const bool enable_syndrome = true,
+                                                                      const int syndrome_depth = 1) const
+    {
+        if (simd_strategy.empty() && implem == "OMS")
+        {
+            struct Update_rule_OMS_sat_i16 : public aff3ct::tools::Update_rule_OMS<int16_t>
+            {
+                const int16_t sat_val;
+                Update_rule_OMS_sat_i16(const int16_t offset, const int16_t sat_val)
+                  : aff3ct::tools::Update_rule_OMS<int16_t>(offset)
+                  , sat_val(sat_val)
+                {
+                }
+                inline int16_t compute_chk_node_out(const int var_id, const int16_t var_val)
+                {
+                    const int16_t val = aff3ct::tools::Update_rule_OMS<int16_t>::compute_chk_node_out(var_id, var_val);
+                    return std::min<int16_t>(this->sat_val, std::max<int16_t>((int16_t)-this->sat_val, val));
+                }
+            };
+            struct Decoder_flooding_sat_i16
+              : public aff3ct::module::Decoder_LDPC_BP_flooding<int16_t, int16_t, Update_rule_OMS_sat_i16>
+            {
+                using Base = aff3ct::module::Decoder_LDPC_BP_flooding<int16_t, int16_t, Update_rule_OMS_sat_i16>;
+                using Base::Base;
+                static inline int16_t clamp_i16(int32_t x)
+                {
+                    return (int16_t)std::min<int32_t>(32767, std::max<int32_t>(-32768, x));
+                }
+                Decoder_flooding_sat_i16* clone() const override
+                {
+                    auto m = new Decoder_flooding_sat_i16(*this);
+                    m->deep_copy(*this);
+                    return m;
+                }
+                int _decode_siho(const int16_t* Y_N, int8_t* CWD, int16_t* V_K, const size_t frame_id) override
+                {
+                    this->up_rule.begin_decoding(this->n_ite);
+                    auto& msg_c2v = this->msg_chk_to_var[frame_id];
+                    auto& msg_v2c = this->msg_var_to_chk[frame_id];
+                    const int n_var = (int)this->H.get_n_rows();
+                    bool valid_synd = true;
+                    int ite = 0;
+                    for (; ite < this->n_ite; ite++)
+                    {
+                        this->up_rule.begin_ite(ite);
+                        const int16_t* c2v_ptr = msg_c2v.data();
+                        int16_t* v2c_ptr = msg_v2c.data();
+                        for (int v = 0; v < n_var; v++)
+                        {
+                            const int deg = (int)this->H.get_row_to_cols()[v].size();
+                            int16_t acc = 0;
+                            for (int c = 0; c < deg; c++)
+                                acc = clamp_i16((int32_t)acc + (int32_t)c2v_ptr[c]);
+                            const int16_t tmp = clamp_i16((int32_t)Y_N[v] + (int32_t)acc);
+                            for (int c = 0; c < deg; c++)
+                                v2c_ptr[c] = clamp_i16((int32_t)tmp - (int32_t)c2v_ptr[c]);
+                            c2v_ptr += deg;
+                            v2c_ptr += deg;
+                        }
+                        this->_decode_single_ite(msg_v2c, msg_c2v);
+                        this->up_rule.end_ite();
+                        if (this->enable_syndrome && ite != this->n_ite - 1)
+                        {
+                            c2v_ptr = msg_c2v.data();
+                            for (int v = 0; v < n_var; v++)
+                            {
+                                const int deg = (int)this->H.get_row_to_cols()[v].size();
+                                int16_t acc = 0;
+                                for (int c = 0; c < deg; c++)
+                                    acc = clamp_i16((int32_t)acc + (int32_t)c2v_ptr[c]);
+                                this->post[v] = clamp_i16((int32_t)Y_N[v] + (int32_t)acc);
+                                c2v_ptr += deg;
+                            }
+                            valid_synd = this->template check_syndrome_soft<int16_t, aff3ct::tools::LDPC_syndrome>(
+                              this->post.data());
+                            if (valid_synd) break;
+                        }
+                    }
+                    if (ite == this->n_ite)
+                    {
+                        const int16_t* c2v_ptr = msg_c2v.data();
+                        for (int v = 0; v < n_var; v++)
+                        {
+                            const int deg = (int)this->H.get_row_to_cols()[v].size();
+                            int16_t acc = 0;
+                            for (int c = 0; c < deg; c++)
+                                acc = clamp_i16((int32_t)acc + (int32_t)c2v_ptr[c]);
+                            this->post[v] = clamp_i16((int32_t)Y_N[v] + (int32_t)acc);
+                            c2v_ptr += deg;
+                        }
+                    }
+                    this->up_rule.end_decoding();
+                    for (int v = 0; v < this->K; v++)
+                        V_K[v] = !(this->post[this->info_bits_pos[v]] >= 0);
+                    CWD[0] = valid_synd;
+                    return !valid_synd;
+                }
+            };
+            struct Decoder_layered_sat_i16
+              : public aff3ct::module::Decoder_LDPC_BP_horizontal_layered<int16_t, int16_t, Update_rule_OMS_sat_i16>
+            {
+                using Base =
+                  aff3ct::module::Decoder_LDPC_BP_horizontal_layered<int16_t, int16_t, Update_rule_OMS_sat_i16>;
+                using Base::Base;
+                static inline int16_t clamp_i16(int32_t x)
+                {
+                    return (int16_t)std::min<int32_t>(32767, std::max<int32_t>(-32768, x));
+                }
+                Decoder_layered_sat_i16* clone() const override
+                {
+                    auto m = new Decoder_layered_sat_i16(*this);
+                    m->deep_copy(*this);
+                    return m;
+                }
+                int _decode_siho(const int16_t* Y_N, int8_t* CWD, int16_t* V_K, const size_t frame_id) override
+                {
+                    auto& vn = this->var_nodes[frame_id];
+                    auto& msgs = this->messages[frame_id];
+                    for (size_t v = 0; v < vn.size(); v++)
+                        vn[v] = clamp_i16((int32_t)vn[v] + (int32_t)Y_N[v]);
+                    this->up_rule.begin_decoding(this->n_ite);
+                    bool valid_synd = true;
+                    const int n_chk = (int)this->H.get_n_cols();
+                    for (int ite = 0; ite < this->n_ite; ite++)
+                    {
+                        this->up_rule.begin_ite(ite);
+                        int kr = 0, kw = 0;
+                        for (int c = 0; c < n_chk; c++)
+                        {
+                            const int deg = (int)this->H[c].size();
+                            this->up_rule.begin_chk_node_in(c, deg);
+                            for (int v = 0; v < deg; v++)
+                            {
+                                this->contributions[v] = clamp_i16((int32_t)vn[this->H[c][v]] - (int32_t)msgs[kr++]);
+                                this->up_rule.compute_chk_node_in(v, this->contributions[v]);
+                            }
+                            this->up_rule.end_chk_node_in();
+                            this->up_rule.begin_chk_node_out(c, deg);
+                            for (int v = 0; v < deg; v++)
+                            {
+                                msgs[kw] = this->up_rule.compute_chk_node_out(v, this->contributions[v]);
+                                vn[this->H[c][v]] = clamp_i16((int32_t)this->contributions[v] + (int32_t)msgs[kw++]);
+                            }
+                            this->up_rule.end_chk_node_out();
+                        }
+                        this->up_rule.end_ite();
+                        valid_synd = this->template check_syndrome_soft<int16_t, aff3ct::tools::LDPC_syndrome>(
+                          vn.data());
+                        if (valid_synd) break;
+                    }
+                    this->up_rule.end_decoding();
+                    for (int i = 0; i < this->K; i++)
+                        V_K[i] = !(vn[this->info_bits_pos[i]] >= 0);
+                    const int status = !valid_synd && this->enable_syndrome;
+                    CWD[0] = !status;
+                    return status;
+                }
+            };
+            Update_rule_OMS_sat_i16 rule((int16_t)offset, this->sat_val_i16_);
+            if (type == "BP_HORIZONTAL_LAYERED")
+                return new Decoder_layered_sat_i16(
+                  this->K_, this->N_cw_, n_ite, this->H_, this->info_bits_pos_, rule, enable_syndrome, syndrome_depth);
+            else
+                return new Decoder_flooding_sat_i16(
+                  this->K_, this->N_cw_, n_ite, this->H_, this->info_bits_pos_, rule, enable_syndrome, syndrome_depth);
+        }
+
+        aff3ct::factory::Decoder_LDPC dec_params;
+        dec_params.K = this->K_;
+        dec_params.N_cw = this->N_cw_;
+        dec_params.type = type;
+        dec_params.implem = implem;
+        dec_params.n_ite = n_ite;
+        dec_params.simd_strategy = simd_strategy;
+        dec_params.offset = offset;
+        dec_params.norm_factor = norm_factor;
+        dec_params.enable_syndrome = enable_syndrome;
+        dec_params.syndrome_depth = syndrome_depth;
+        return dec_params.build<int16_t, int16_t>(this->H_, this->info_bits_pos_);
+    }
 };
 
 using Monitor_BFER_int = aff3ct::module::Monitor_BFER<int>;
 using Monitor_BFER_reduction = aff3ct::tools::Monitor_reduction<Monitor_BFER_int>;
+
+using Monitor_BFER_i16 = aff3ct::module::Monitor_BFER<int16_t>;
+using Monitor_BFER_reduction_i16 = aff3ct::tools::Monitor_reduction<Monitor_BFER_i16>;
 
 } // namespace
 
@@ -286,10 +608,14 @@ PYBIND11_MODULE(py_aff3ct, m)
       .def("get_sigma", &Sigma_buffer::get_sigma)
       .def("bind", &Sigma_buffer::bind, "socket"_a);
 
-    // --- Source_random_fast ---
+    // --- Source_random_fast (32-bit and 16-bit) ---
     py::class_<aff3ct::module::Source_random_fast<int>, spu::module::Source<int>>(m, "Source_random_fast")
       .def(py::init<const int, const int>(), "K"_a, "seed"_a = 0)
       .def("set_seed", &aff3ct::module::Source_random_fast<int>::set_seed, "seed"_a);
+
+    py::class_<aff3ct::module::Source_random_fast<int16_t>, spu::module::Source<int16_t>>(m, "Source_random_fast_i16")
+      .def(py::init<const int, const int>(), "K"_a, "seed"_a = 0)
+      .def("set_seed", &aff3ct::module::Source_random_fast<int16_t>::set_seed, "seed"_a);
 
     // --- Repetition Codec ---
     py::class_<aff3ct::module::Encoder_repetition_sys<int>, spu::module::Stateful>(m, "Encoder_repetition_sys")
@@ -305,9 +631,19 @@ PYBIND11_MODULE(py_aff3ct, m)
                spu::tools::Interface_reset>(m, "Decoder_repetition_fast")
       .def(py::init<const int&, const int&, const bool>(), "K"_a, "N"_a, "buffered_encoding"_a = true);
 
-    // --- Modem BPSK Fast ---
+    // --- Modem BPSK Fast (32-bit and 16-bit) ---
     py::class_<aff3ct::module::Modem_BPSK_fast<int, float, float>, spu::module::Stateful>(m, "Modem_BPSK_fast")
       .def(py::init<const int, const bool>(), "N"_a, "disable_sig2"_a = false);
+
+    py::class_<aff3ct::module::Modem_BPSK_fast<int16_t, float, float>, spu::module::Stateful>(m, "Modem_BPSK_fast_i16")
+      .def(py::init<const int, const bool>(), "N"_a, "disable_sig2"_a = false);
+
+    // --- Quantizer Pow2 Fast (float -> int16_t) ---
+    py::class_<aff3ct::module::Quantizer_pow2_fast<float, int16_t>, spu::module::Stateful>(m, "Quantizer_pow2_fast_i16")
+      .def(py::init<const int, const short&, const short&>(),
+           "N"_a,
+           "n_decimals"_a = 2,
+           "n_bits"_a = 8);
 
     // --- Channel AWGN LLR ---
     py::class_<aff3ct::module::Channel_AWGN_LLR<float>,
@@ -327,7 +663,7 @@ PYBIND11_MODULE(py_aff3ct, m)
            "add_users"_a = false)
       .def("set_seed", &aff3ct::module::Channel_AWGN_LLR<float>::set_seed, "seed"_a);
 
-    // --- Monitor_BFER & Monitor_BFER_reduction ---
+    // --- Monitor_BFER & Monitor_BFER_reduction (32-bit) ---
     py::class_<Monitor_BFER_int,
                spu::module::Stateful,
                spu::tools::Interface_is_done,
@@ -367,12 +703,58 @@ PYBIND11_MODULE(py_aff3ct, m)
       .def("get_fer", &Monitor_BFER_reduction::get_fer)
       .def("get_ber", &Monitor_BFER_reduction::get_ber);
 
+    // --- Monitor_BFER & Monitor_BFER_reduction (16-bit) ---
+    py::class_<Monitor_BFER_i16,
+               spu::module::Stateful,
+               spu::tools::Interface_is_done,
+               spu::tools::Interface_reset>(m, "Monitor_BFER_i16")
+      .def(py::init<const int, const unsigned, const unsigned, const bool>(),
+           "K"_a,
+           "max_fe"_a = 100,
+           "max_n_frames"_a = 0,
+           "count_unknown_values"_a = false)
+      .def("get_K", &Monitor_BFER_i16::get_K)
+      .def("get_max_fe", &Monitor_BFER_i16::get_max_fe)
+      .def("get_max_n_frames", &Monitor_BFER_i16::get_max_n_frames)
+      .def("get_n_analyzed_fra", &Monitor_BFER_i16::get_n_analyzed_fra)
+      .def("get_n_fe", &Monitor_BFER_i16::get_n_fe)
+      .def("get_n_be", &Monitor_BFER_i16::get_n_be)
+      .def("get_fer", &Monitor_BFER_i16::get_fer)
+      .def("get_ber", &Monitor_BFER_i16::get_ber)
+      .def("fe_limit_achieved", &Monitor_BFER_i16::fe_limit_achieved)
+      .def("frame_limit_achieved", &Monitor_BFER_i16::frame_limit_achieved)
+      .def("is_done", &Monitor_BFER_i16::is_done)
+      .def("disable_is_done", &Monitor_BFER_i16::disable_is_done, "no_is_done"_a)
+      .def("reset", &Monitor_BFER_i16::reset);
+
+    py::class_<Monitor_BFER_reduction_i16>(m, "Monitor_BFER_reduction_i16")
+      .def(py::init<const std::vector<Monitor_BFER_i16*>&>(), "monitors"_a)
+      .def(
+        "set_reduce_frequency_ms",
+        [](Monitor_BFER_reduction_i16& self, const int ms)
+        { self.set_reduce_frequency(std::chrono::milliseconds(ms)); },
+        "ms"_a = 1)
+      .def("is_done", &Monitor_BFER_reduction_i16::is_done)
+      .def("reduce", &Monitor_BFER_reduction_i16::reduce, "fully"_a = true)
+      .def("reset", &Monitor_BFER_reduction_i16::reset)
+      .def("get_n_analyzed_fra", &Monitor_BFER_reduction_i16::get_n_analyzed_fra)
+      .def("get_n_fe", &Monitor_BFER_reduction_i16::get_n_fe)
+      .def("get_n_be", &Monitor_BFER_reduction_i16::get_n_be)
+      .def("get_fer", &Monitor_BFER_reduction_i16::get_fer)
+      .def("get_ber", &Monitor_BFER_reduction_i16::get_ber);
+
     // --- LDPC Base Classes & LDPC_Code Helper ---
     py::class_<aff3ct::module::Encoder_LDPC<int>, spu::module::Stateful>(m, "Encoder_LDPC");
     py::class_<aff3ct::module::Puncturer<int, float>, spu::module::Stateful>(m, "Puncturer");
     py::class_<aff3ct::module::Decoder_SIHO<int, float>,
                spu::module::Stateful,
                spu::tools::Interface_reset>(m, "Decoder_SIHO");
+
+    py::class_<aff3ct::module::Encoder_LDPC<int16_t>, spu::module::Stateful>(m, "Encoder_LDPC_i16");
+    py::class_<aff3ct::module::Puncturer<int16_t, int16_t>, spu::module::Stateful>(m, "Puncturer_i16");
+    py::class_<aff3ct::module::Decoder_SIHO<int16_t, int16_t>,
+               spu::module::Stateful,
+               spu::tools::Interface_reset>(m, "Decoder_SIHO_i16");
 
     py::class_<LDPC_Code>(m, "LDPC_Code")
       .def(py::init<const int, const int, const std::string&, const std::string&, const std::string&>(),
@@ -389,13 +771,23 @@ PYBIND11_MODULE(py_aff3ct, m)
       .def_property_readonly("n_connections", &LDPC_Code::get_n_connections)
       .def_property_readonly("cols_max_degree", &LDPC_Code::get_cols_max_degree)
       .def_property_readonly("rows_max_degree", &LDPC_Code::get_rows_max_degree)
+      .def_property_readonly("sat_val_i16", &LDPC_Code::get_sat_val_i16)
       .def("get_qc_path", &LDPC_Code::get_qc_path)
+      .def("get_tanner_graph_arrays", &LDPC_Code::get_tanner_graph_arrays)
       .def("get_julia_graph_ctor",
            &LDPC_Code::get_julia_graph_ctor,
            "n_ite"_a = 20,
            "enable_syndrome"_a = true,
-           "syndrome_depth"_a = 1)
-      .def("get_julia_workspace_ctor", &LDPC_Code::get_julia_workspace_ctor)
+           "syndrome_depth"_a = 1,
+           "dec_type"_a = "BP_FLOODING",
+           "dec_implem"_a = "SPA",
+           "q_type"_a = "f32",
+           "offset"_a = 0.0f)
+      .def("get_julia_workspace_ctor",
+           &LDPC_Code::get_julia_workspace_ctor,
+           "simd_strategy"_a = "",
+           "q_type"_a = "f32",
+           "n_frames_per_wave"_a = 1)
       .def("build_encoder", &LDPC_Code::build_encoder, py::return_value_policy::take_ownership)
       .def("build_puncturer", &LDPC_Code::build_puncturer, py::return_value_policy::take_ownership)
       .def("build_decoder",
@@ -408,6 +800,24 @@ PYBIND11_MODULE(py_aff3ct, m)
            "norm_factor"_a = 1.0f,
            "enable_syndrome"_a = true,
            "syndrome_depth"_a = 1,
+           py::return_value_policy::take_ownership)
+      .def("build_encoder_i16", &LDPC_Code::build_encoder_i16, py::return_value_policy::take_ownership)
+      .def("build_puncturer_i16", &LDPC_Code::build_puncturer_i16, py::return_value_policy::take_ownership)
+      .def("build_quantizer_i16",
+           &LDPC_Code::build_quantizer_i16,
+           "n_decimals"_a = 2,
+           "n_bits"_a = 8,
+           py::return_value_policy::take_ownership)
+      .def("build_decoder_i16",
+           &LDPC_Code::build_decoder_i16,
+           "type"_a = "BP_FLOODING",
+           "implem"_a = "OMS",
+           "n_ite"_a = 20,
+           "simd_strategy"_a = "",
+           "offset"_a = 1.0f,
+           "norm_factor"_a = 1.0f,
+           "enable_syndrome"_a = true,
+           "syndrome_depth"_a = 1,
            py::return_value_policy::take_ownership);
 
     // --- Runtime seeding, reset, and execution helpers matching the C++ binaries ---
@@ -416,7 +826,9 @@ PYBIND11_MODULE(py_aff3ct, m)
       [](spu::runtime::Sequence& seq)
       {
           std::mt19937 prng;
-          for (auto* mod : seq.get_modules<spu::module::Source<>>())
+          for (auto* mod : seq.get_modules<spu::module::Source<int>>())
+              mod->set_seed(prng());
+          for (auto* mod : seq.get_modules<spu::module::Source<int16_t>>())
               mod->set_seed(prng());
           for (auto* mod : seq.get_modules<aff3ct::module::Channel<>>())
               mod->set_seed(prng());
@@ -429,7 +841,9 @@ PYBIND11_MODULE(py_aff3ct, m)
       [](spu::runtime::Pipeline& pipe)
       {
           std::mt19937 prng;
-          for (auto* mod : pipe.get_modules<spu::module::Source<>>())
+          for (auto* mod : pipe.get_modules<spu::module::Source<int>>())
+              mod->set_seed(prng());
+          for (auto* mod : pipe.get_modules<spu::module::Source<int16_t>>())
               mod->set_seed(prng());
           for (auto* mod : pipe.get_modules<aff3ct::module::Channel<>>())
               mod->set_seed(prng());
@@ -504,7 +918,22 @@ PYBIND11_MODULE(py_aff3ct, m)
       },
       "sequence"_a,
       "monitor_red"_a,
-      "Execute a replicated Sequence until Monitor_BFER_reduction is done and return elapsed time in microseconds.");
+      "Execute a replicated Sequence (int32) until Monitor_BFER_reduction is done and return elapsed time in microseconds.");
+
+    m.def(
+      "exec_sequence_i16",
+      [](spu::runtime::Sequence& seq, Monitor_BFER_reduction_i16& mnt_red) -> double
+      {
+          py::gil_scoped_release release{};
+          const auto t_start = std::chrono::steady_clock::now();
+          seq.exec([&]() -> bool { return mnt_red.is_done() || seq.is_done(); });
+          mnt_red.reduce();
+          const auto t_stop = std::chrono::steady_clock::now();
+          return std::chrono::duration<double, std::micro>(t_stop - t_start).count();
+      },
+      "sequence"_a,
+      "monitor_red"_a,
+      "Execute a replicated Sequence (int16) until Monitor_BFER_reduction_i16 is done and return elapsed time in microseconds.");
 
     m.def(
       "exec_pipeline",
@@ -541,5 +970,42 @@ PYBIND11_MODULE(py_aff3ct, m)
       "source"_a,
       "max_frame"_a = 0,
       "n_frames"_a = 1,
-      "Execute a 3-stage Pipeline until monitor/frame limit is reached and return elapsed time in microseconds.");
+      "Execute a 3-stage Pipeline (int32) until monitor/frame limit is reached and return elapsed time in microseconds.");
+
+    m.def(
+      "exec_pipeline_i16",
+      [](spu::runtime::Pipeline& pipe,
+         Monitor_BFER_i16& mnt,
+         spu::module::Source<int16_t>& src,
+         const size_t max_frame,
+         const size_t n_frames) -> double
+      {
+          py::gil_scoped_release release{};
+          const auto t_start = std::chrono::steady_clock::now();
+          if (max_frame > 0)
+          {
+              size_t generated_fra = 0;
+              mnt.disable_is_done(true);
+              pipe.exec(std::vector<std::function<bool()>>{
+                [&]() -> bool
+                {
+                    generated_fra += n_frames;
+                    return generated_fra >= max_frame || mnt.fe_limit_achieved() || src.is_done();
+                },
+                [&]() -> bool { return mnt.fe_limit_achieved(); },
+                [&]() -> bool { return mnt.fe_limit_achieved(); } });
+          }
+          else
+          {
+              pipe.exec();
+          }
+          const auto t_stop = std::chrono::steady_clock::now();
+          return std::chrono::duration<double, std::micro>(t_stop - t_start).count();
+      },
+      "pipeline"_a,
+      "monitor"_a,
+      "source"_a,
+      "max_frame"_a = 0,
+      "n_frames"_a = 1,
+      "Execute a 3-stage Pipeline (int16) until monitor/frame limit is reached and return elapsed time in microseconds.");
 }
