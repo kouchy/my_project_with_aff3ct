@@ -1,6 +1,9 @@
 # 5G NR UL-SCH LDPC Pipeline Example with StreamPU × Julia (`Stateful_Julia`)
 
-This example demonstrates a 3-stage multi-threaded **5G NR UL-SCH LDPC** digital communication chain built with **AFF3CT** and **StreamPU**, where the **LDPC Belief Propagation (BP) Flooding Sum-Product Algorithm (SPA)** decoder can be executed either with AFF3CT's native C++ implementation or with a **Julia** implementation (`src/ldpc_bp_flooding_spa.jl`) wrapped in `spu::module::Stateful_Julia`.
+This example demonstrates a 3-stage multi-threaded **5G NR UL-SCH LDPC** digital communication chain built with **AFF3CT** and **StreamPU**, where the **LDPC Belief Propagation (BP)** decoder (`BP_FLOODING` / `BP_HORIZONTAL_LAYERED`, `SPA` / `OMS`, `Float32` / `Int16`, Scalar / Inter-Frame SIMD) can be executed either with AFF3CT's native C++ implementation or with one of three **Julia** implementations wrapped in `spu::module::Stateful_Julia`:
+- `src/ldpc_bp_naive.jl` (`--dec-implem SPA_JL_NAIVE` / `OMS_JL_NAIVE`): compact textbook algorithmic specification (~195 lines)
+- `src/ldpc_bp_std.jl` (`--dec-implem SPA_JL_STD` / `OMS_JL_STD`): idiomatic zero-allocation high-performance Julia (~450 lines, zero `llvmcall`)
+- `src/ldpc_bp_opt.jl` (`--dec-implem SPA_JL` / `OMS_JL` / `SPA_JL_OPT` / `OMS_JL_OPT`, default): hardware-optimized LLVM SIMD vector implementation
 
 ## Build
 

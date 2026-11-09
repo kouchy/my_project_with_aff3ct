@@ -141,7 +141,7 @@ struct params : public factory::Factory
     float       R              = 0.0f;  // code rate (R=K/N)
     bool        jl_dec         = false; // use the Julia Stateful_Julia LDPC decoder
     bool        jl_safe        = false; // enable Julia exception checking on every call
-    std::string jl_path        = "../src/ldpc_bp_flooding_spa.jl";
+    std::string jl_path        = "../src/ldpc_bp_opt.jl";
     bool        stats          = false; // enable per-task execution statistics (disables fast mode)
     bool        verbose        = false; // display per-SNR execution statistics (# Exec_stats)
     bool        force_sequence = false; // run a replicated Sequence instead of the 3-stage Pipeline
@@ -195,7 +195,24 @@ struct params : public factory::Factory
         args.add({ "dec-jl"                   }, cli::None(),                                    "use the Julia Stateful_Julia generic LDPC decoder.");
         args.add({ "dec-jl-safe"              }, cli::None(),                                    "enable Julia exception checking on every call.");
         args.add({ "dec-jl-path"              }, cli::File(cli::openmode::read),                 "set the path to the Julia LDPC decoder script.");
-        cli::add_options(args.at({ "dec-implem" }), 0, "SPA_JL", "OMS_JL");
+        cli::add_options(args.at({ "dec-implem" }), 0, "SPA_JL", "OMS_JL", "SPA_JL_NAIVE", "SPA_JL_STD", "SPA_JL_OPT", "OMS_JL_NAIVE", "OMS_JL_STD", "OMS_JL_OPT");
+    }
+
+    static std::string resolve_default_jl_path(const std::string& filename)
+    {
+        const std::vector<std::string> candidates = {
+            "../src/" + filename,
+            "src/" + filename,
+            "examples/ldpc_5g_julia/src/" + filename,
+            "my_project_with_aff3ct/examples/ldpc_5g_julia/src/" + filename
+        };
+        for (const auto& c : candidates)
+        {
+            std::ifstream f(c);
+            if (f.good())
+                return c;
+        }
+        return "../src/" + filename;
     }
 
     virtual void store(const cli::Argument_map_value& vals) override
@@ -218,35 +235,50 @@ struct params : public factory::Factory
         if (vals.exist({ p + "-dot"                 })) this->dot_filepath   = vals.to_file ({ p + "-dot"                 });
         if (vals.exist({ "dec-jl"                   })) this->jl_dec         = true;
         if (vals.exist({ "dec-jl-safe"              })) this->jl_safe        = true;
-        if (vals.exist({ "dec-jl-path"              })) this->jl_path        = vals.to_file ({ "dec-jl-path"              });
-        else
-        {
-            const std::vector<std::string> candidates = {
-                "../src/ldpc_bp_flooding_spa.jl",
-                "src/ldpc_bp_flooding_spa.jl",
-                "examples/ldpc_5g_julia/src/ldpc_bp_flooding_spa.jl"
-            };
-            for (const auto& c : candidates)
-            {
-                std::ifstream f(c);
-                if (f.good())
-                {
-                    this->jl_path = c;
-                    break;
-                }
-            }
-        }
 
-        if (this->codec->dec->implem == "SPA_JL")
+        std::string default_jl_file = "ldpc_bp_opt.jl";
+        const auto imp = this->codec->dec->implem;
+        if (imp == "SPA_JL" || imp == "SPA_JL_OPT")
         {
             this->jl_dec = true;
             this->codec->dec->implem = "SPA";
+            default_jl_file = "ldpc_bp_opt.jl";
         }
-        else if (this->codec->dec->implem == "OMS_JL")
+        else if (imp == "SPA_JL_STD")
+        {
+            this->jl_dec = true;
+            this->codec->dec->implem = "SPA";
+            default_jl_file = "ldpc_bp_std.jl";
+        }
+        else if (imp == "SPA_JL_NAIVE")
+        {
+            this->jl_dec = true;
+            this->codec->dec->implem = "SPA";
+            default_jl_file = "ldpc_bp_naive.jl";
+        }
+        else if (imp == "OMS_JL" || imp == "OMS_JL_OPT")
         {
             this->jl_dec = true;
             this->codec->dec->implem = "OMS";
+            default_jl_file = "ldpc_bp_opt.jl";
         }
+        else if (imp == "OMS_JL_STD")
+        {
+            this->jl_dec = true;
+            this->codec->dec->implem = "OMS";
+            default_jl_file = "ldpc_bp_std.jl";
+        }
+        else if (imp == "OMS_JL_NAIVE")
+        {
+            this->jl_dec = true;
+            this->codec->dec->implem = "OMS";
+            default_jl_file = "ldpc_bp_naive.jl";
+        }
+
+        if (vals.exist({ "dec-jl-path" }))
+            this->jl_path = vals.to_file({ "dec-jl-path" });
+        else
+            this->jl_path = resolve_default_jl_path(default_jl_file);
 
         // Propagate K and N from Codec_LDPC to the other module factories
         this->source ->K = this->codec->K;

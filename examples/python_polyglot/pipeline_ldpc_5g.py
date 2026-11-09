@@ -23,7 +23,7 @@ if HERE not in sys.path:
 
 import streampu as spu
 import py_aff3ct
-from ldpc_decoder_py import DecoderLDPCPython
+from tasks.ldpc_decoder_py import DecoderLDPCPython
 
 
 def build_decoder_ldpc_julia(
@@ -80,7 +80,8 @@ def build_decoder_ldpc_julia(
 
 
 def parse_args():
-    default_jl_path = os.path.normpath(os.path.join(HERE, "..", "ldpc_5g_julia", "src", "ldpc_bp_flooding_spa.jl"))
+    jl_src_dir = os.path.normpath(os.path.join(HERE, "..", "ldpc_5g_julia", "src"))
+    default_jl_path = os.path.join(jl_src_dir, "ldpc_bp_opt.jl")
     p = argparse.ArgumentParser(description="Polyglot 5G NR QC-LDPC Pipeline / Sequence Benchmark (pyStreamPU)")
     p.add_argument("-K", "--info-bits", type=int, default=512, help="Information bits K (default: 512)")
     p.add_argument("-N", "--cw-size", type=int, default=1024, help="Transmitted codeword size N (default: 1024)")
@@ -108,6 +109,18 @@ def parse_args():
             "AMS",
             "SPA_JL",
             "OMS_JL",
+            "SPA_JL_NAIVE",
+            "OMS_JL_NAIVE",
+            "SPA_JL_STD",
+            "OMS_JL_STD",
+            "SPA_JL_OPT",
+            "OMS_JL_OPT",
+            "SPA_PY_NAIVE",
+            "OMS_PY_NAIVE",
+            "SPA_PY_STD",
+            "OMS_PY_STD",
+            "SPA_PY_OPT",
+            "OMS_PY_OPT",
             "SPA_PY_NUMBA",
             "OMS_PY_NUMBA",
             "SPA_PY_NUMPY",
@@ -126,8 +139,14 @@ def parse_args():
     p.add_argument("--dec-synd-depth", type=int, default=1, help="Syndrome stopping depth (default: 1)")
     p.add_argument("--dec-jl", action="store_true", help="Use Julia Stateful_Julia LDPC decoder")
     p.add_argument("--dec-jl-safe", action="store_true", help="Enable Julia exception checking on every call")
-    p.add_argument("--dec-jl-path", type=str, default=default_jl_path, help="Path to ldpc_bp_flooding_spa.jl")
-    p.add_argument("--dec-py", type=str, default="", choices=["", "NUMBA", "NUMPY"], help="Use Python Stateful_core LDPC decoder (NUMBA or NUMPY)")
+    p.add_argument("--dec-jl-path", type=str, default="", help=f"Path to Julia LDPC decoder script (default: {default_jl_path})")
+    p.add_argument(
+        "--dec-py",
+        type=str,
+        default="",
+        choices=["", "NAIVE", "STD", "OPT", "NUMBA", "NUMPY"],
+        help="Use Python Stateful_core LDPC decoder (NAIVE, STD, OPT/NUMBA, or NUMPY)",
+    )
     p.add_argument("-F", "--inter-fra", type=int, default=1, help="Inter-frame level F (default: 1)")
     p.add_argument("-t", "--threads", type=int, default=os.cpu_count() or 1, help="Number of worker threads")
     p.add_argument("-m", "--ebn0-min", type=float, default=0.0, help="Min Eb/N0 in dB")
@@ -156,18 +175,45 @@ def main():
     implem = args.dec_implem
     jl_dec = args.dec_jl
     py_mode = args.dec_py
+    jl_src_dir = os.path.normpath(os.path.join(HERE, "..", "ldpc_5g_julia", "src"))
+    default_jl_file = "ldpc_bp_opt.jl"
 
-    if implem.endswith("_JL"):
+    if implem.endswith("_JL_NAIVE"):
+        jl_dec = True
+        base_rule = implem[:-9]
+        default_jl_file = "ldpc_bp_naive.jl"
+    elif implem.endswith("_JL_STD"):
+        jl_dec = True
+        base_rule = implem[:-7]
+        default_jl_file = "ldpc_bp_std.jl"
+    elif implem.endswith("_JL_OPT"):
+        jl_dec = True
+        base_rule = implem[:-7]
+        default_jl_file = "ldpc_bp_opt.jl"
+    elif implem.endswith("_JL"):
         jl_dec = True
         base_rule = implem[:-3]
+        default_jl_file = "ldpc_bp_opt.jl"
+    elif implem.endswith("_PY_NAIVE"):
+        py_mode = "NAIVE"
+        base_rule = implem[:-9]
+    elif implem.endswith("_PY_STD"):
+        py_mode = "STD"
+        base_rule = implem[:-7]
+    elif implem.endswith("_PY_OPT"):
+        py_mode = "OPT"
+        base_rule = implem[:-7]
     elif implem.endswith("_PY_NUMBA"):
-        py_mode = "NUMBA"
+        py_mode = "OPT"
         base_rule = implem[:-9]
     elif implem.endswith("_PY_NUMPY"):
         py_mode = "NUMPY"
         base_rule = implem[:-9]
     else:
         base_rule = implem
+
+    if not args.dec_jl_path:
+        args.dec_jl_path = os.path.join(jl_src_dir, default_jl_file)
 
     if args.dec_off is not None:
         offset = args.dec_off
@@ -226,7 +272,8 @@ def main():
             args.dec_jl_safe,
         )
         dec_desc = f"Julia Stateful_Julia ({args.dec_type} {base_rule} {dtype_str}{simd_tag}, i={args.dec_ite}, {'safe' if args.dec_jl_safe else 'unsafe'})"
-    elif py_mode in ("NUMBA", "NUMPY"):
+    elif py_mode in ("NAIVE", "STD", "OPT", "NUMBA", "NUMPY"):
+        py_tier = "opt" if py_mode == "NUMBA" else py_mode.lower()
         decoder = DecoderLDPCPython(
             code=code,
             dec_type=args.dec_type,
@@ -238,7 +285,8 @@ def main():
             enable_syndrome=enable_syndrome,
             syndrome_depth=args.dec_synd_depth,
             n_frames=n_frames,
-            use_numba=(py_mode == "NUMBA"),
+            use_numba=(py_mode != "NUMPY"),
+            py_tier=py_tier,
         )
         dec_desc = f"Python Stateful_core ({py_mode} {args.dec_type} {base_rule} {dtype_str}{simd_tag}, i={args.dec_ite})"
     else:
@@ -399,6 +447,8 @@ def main():
         runtime.show_stats()
 
     print("#\n# End of the simulation")
+    del monitor_red
+    del runtime
 
 
 if __name__ == "__main__":

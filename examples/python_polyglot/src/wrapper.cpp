@@ -559,7 +559,7 @@ using Monitor_BFER_reduction_i16 = aff3ct::tools::Monitor_reduction<Monitor_BFER
 
 } // namespace
 
-PYBIND11_MODULE(py_aff3ct, m)
+PYBIND11_MODULE(py_aff3ct, m, py::mod_gil_not_used())
 {
     m.doc() = "Minimal pybind11 wrapper exposing AFF3CT C++ modules as StreamPU Stateful modules for polyglot SDR chains";
 
@@ -592,10 +592,7 @@ PYBIND11_MODULE(py_aff3ct, m)
           {
               using spu::module::Stateful::set_single_wave;
           };
-          if (auto* sl = dynamic_cast<spu::module::Stateless*>(&mdl))
-              sl->set_single_wave(enable);
-          else if (auto* sf = dynamic_cast<spu::module::Stateful*>(&mdl))
-              static_cast<Stateful_access*>(sf)->set_single_wave(enable);
+          static_cast<Stateful_access&>(static_cast<spu::module::Stateful&>(mdl)).set_single_wave(enable);
       },
       "module"_a,
       "enable"_a = true,

@@ -11,90 +11,17 @@ entirely from Python using `pyStreamPU` (`streampu`) and `py_aff3ct`, and suppor
 import argparse
 import os
 import sys
-import numpy as np
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 BUILD_DIR = os.path.join(HERE, "build")
 if os.path.isdir(BUILD_DIR) and BUILD_DIR not in sys.path:
     sys.path.insert(0, BUILD_DIR)
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
 
 import streampu as spu
 import py_aff3ct
-
-
-class DecoderRepetitionPython(spu.Stateful_core):
-    """Custom Python repetition decoder implemented as a StreamPU Stateful_core module (NumPy or Numba)."""
-
-    def __init__(self, K: int, N: int, buffered: bool = True, use_numba: bool = False, single_wave: bool = False):
-        super().__init__()
-        self.name = "Decoder_repetition_PY_Numba" if use_numba else "Decoder_repetition_PY_NumPy"
-        self.K = K
-        self.N = N
-        self.rep_count = (N // K) - 1
-        self.buffered = buffered
-        self.use_numba = use_numba
-        self.single_wave = single_wave
-        if single_wave:
-            py_aff3ct.set_single_wave(self, True)
-
-        task = self.create_task("decode_siho")
-        task.replicable = True
-        self.create_socket_in(task, "Y_N", N, spu.float32)
-        self.create_socket_out(task, "V_K", K, spu.int32)
-        if use_numba:
-            self._init_numba()
-            self.create_codelet(task, DecoderRepetitionPython._decode_numba)
-        else:
-            self.create_codelet(task, DecoderRepetitionPython._decode_numpy)
-
-    @staticmethod
-    def _init_numba():
-        if hasattr(DecoderRepetitionPython, "_numba_kernel"):
-            return
-        from numba import njit
-
-        @njit(nogil=True, fastmath=True, cache=True)
-        def _kernel_buf(Y_N, V_K, K, N, rep_count, f_start, f_stop):
-            for f in range(f_start, f_stop):
-                for i in range(K):
-                    acc = Y_N[f, i]
-                    for r in range(1, rep_count + 1):
-                        acc += Y_N[f, r * K + i]
-                    V_K[f, i] = 1 if acc < 0.0 else 0
-
-        DecoderRepetitionPython._numba_kernel = _kernel_buf
-
-    @staticmethod
-    def _decode_numpy(mdl, tsk, frame_id):
-        Y_N = tsk["Y_N"].wave
-        V_K = tsk["V_K"].wave
-        K = mdl.K
-        n_rep = mdl.rep_count + 1
-        f_cnt = Y_N.shape[0]
-        if mdl.buffered:
-            acc = Y_N.reshape(f_cnt, n_rep, K).sum(axis=1)
-        else:
-            acc = Y_N.reshape(f_cnt, K, n_rep).sum(axis=2)
-        V_K[:] = (acc < 0.0).astype(np.int32)
-        return 0
-
-    @staticmethod
-    def _decode_numba(mdl, tsk, frame_id):
-        Y_N = tsk["Y_N"].wave
-        V_K = tsk["V_K"].wave
-        DecoderRepetitionPython._numba_kernel(Y_N, V_K, mdl.K, mdl.N, mdl.rep_count, 0, Y_N.shape[0])
-        return 0
-
-    def clone(self):
-        other = type(self).__new__(type(self))
-        spu.Stateful_core.__init__(other, self)
-        other.K = self.K
-        other.N = self.N
-        other.rep_count = self.rep_count
-        other.buffered = self.buffered
-        other.use_numba = self.use_numba
-        other.single_wave = self.single_wave
-        return other
+from tasks.rep_decoder import DecoderRepetitionPython
 
 
 def build_decoder_rep_julia(
@@ -154,11 +81,29 @@ def parse_args():
         "--dec-implem",
         type=str,
         default="FAST",
-        choices=["FAST", "STD", "JL_V0", "JL_V1", "JL_V2", "JL_V3", "JL_V4", "PY_NUMPY", "PY_NUMPY_SW", "PY_NUMBA", "PY_NUMBA_SW"],
+        choices=[
+            "FAST",
+            "STD",
+            "JL_V0",
+            "JL_V1",
+            "JL_V2",
+            "JL_V3",
+            "JL_V4",
+            "PY_V0",
+            "PY_V1",
+            "PY_V2",
+            "PY_V3",
+            "PY_V4",
+            "PY_NUMPY",
+            "PY_NUMPY_SW",
+            "PY_NUMBA",
+            "PY_NUMBA_SW",
+        ],
         help="Decoder implementation",
     )
     p.add_argument("--dec-jl", action="store_true", help="Use Julia Stateless_Julia repetition decoder")
     p.add_argument("--dec-jl-ver", type=str, default=None, choices=["v0", "v1", "v2", "v3", "v4"], help="Julia decoder tier")
+    p.add_argument("--dec-py-ver", type=str, default=None, choices=["v0", "v1", "v2", "v3", "v4"], help="Python/Numba decoder tier")
     p.add_argument("--dec-jl-safe", action="store_true", help="Force jl_safe=True on v4")
     p.add_argument("--dec-jl-path", type=str, default=default_jl_path, help="Path to rep_decoder.jl")
     p.add_argument("--enc-no-buff", action="store_true", help="Disable buffered encoding")
@@ -206,9 +151,14 @@ def main():
     elif args.dec_implem in ("PY_NUMPY", "PY_NUMPY_SW"):
         decoder = DecoderRepetitionPython(K, N_cw, buffered, use_numba=False, single_wave=(args.dec_implem == "PY_NUMPY_SW"))
         dec_desc = f"Python Stateful_core ({args.dec_implem})"
+    elif args.dec_implem in ("PY_V0", "PY_V1", "PY_V2", "PY_V3", "PY_V4") or args.dec_py_ver is not None:
+        py_ver = args.dec_py_ver or ("v" + args.dec_implem[-1])
+        decoder = DecoderRepetitionPython(K, N_cw, buffered, use_numba=True, py_ver=py_ver)
+        dec_desc = f"Python Stateful_core (Numba {py_ver})"
     elif args.dec_implem in ("PY_NUMBA", "PY_NUMBA_SW"):
-        decoder = DecoderRepetitionPython(K, N_cw, buffered, use_numba=True, single_wave=(args.dec_implem == "PY_NUMBA_SW"))
-        dec_desc = f"Python Stateful_core ({args.dec_implem})"
+        py_ver = "v3" if args.dec_implem == "PY_NUMBA_SW" else "v2"
+        decoder = DecoderRepetitionPython(K, N_cw, buffered, use_numba=True, py_ver=py_ver)
+        dec_desc = f"Python Stateful_core ({args.dec_implem} / Numba {py_ver})"
     else:
         raise ValueError(f"Unsupported decoder implementation: {args.dec_implem}")
 
@@ -325,6 +275,8 @@ def main():
         runtime.show_stats()
 
     print("#\n# End of the simulation")
+    del monitor_red
+    del runtime
 
 
 if __name__ == "__main__":
