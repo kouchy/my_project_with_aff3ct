@@ -37,8 +37,14 @@ You can go in this folder to see the next steps.
 > [!note]
 > If you want to compile Julia examples (or the polyglot Python + Julia + C++
 > examples in [`examples/python_polyglot/`](examples/python_polyglot/README.md)),
-> you need to explicitly link StreamPU with `libjulia` (`-DSPU_LINK_JULIA="ON"`)
-> and also install the StreamPU library alongside AFF3CT so that both `AFF3CT`
+> first align `lib/aff3ct/lib/streampu` onto the newer `StreamPU` version shipped
+> in `lib/pystreampu/lib/streampu`:
+> ```bash
+> git -C lib/aff3ct/lib/streampu fetch ../../pystreampu/lib/streampu
+> git -C lib/aff3ct/lib/streampu checkout $(git -C lib/pystreampu/lib/streampu rev-parse HEAD)
+> ```
+> Then explicitly link StreamPU with `libjulia` (`-DSPU_LINK_JULIA="ON"`)
+> and install the StreamPU library alongside AFF3CT so that both `AFF3CT`
 > and `pyStreamPU` share the exact same `StreamPU` instance:
 > ```bash
 > cmake .. -G"Unix Makefiles" -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_CXX_FLAGS="-Wall -funroll-loops -march=native" \

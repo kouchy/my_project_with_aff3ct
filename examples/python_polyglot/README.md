@@ -24,16 +24,21 @@ Ensure the following tools are installed and available in your `PATH`:
 - **Julia** ($\ge 1.10$, `julia` executable on `PATH`) — no external Julia packages are required (all kernels use only Julia `Base`, `Base.Cartesian`, and `Core.Intrinsics.llvmcall`)
 - **Python** ($\ge 3.10$) with `venv` support
 
-Initialize all Git submodules from the root of `my_project_with_aff3ct`:
+Initialize all Git submodules from the root of `my_project_with_aff3ct`, and synchronize `lib/aff3ct/lib/streampu` onto the newer `StreamPU` version shipped in `lib/pystreampu/lib/streampu`:
 
 ```bash
+# From the root of my_project_with_aff3ct:
 git submodule update --init --recursive
+
+# Align AFF3CT's StreamPU submodule with the newer StreamPU version in pyStreamPU:
+git -C lib/aff3ct/lib/streampu fetch ../../pystreampu/lib/streampu
+git -C lib/aff3ct/lib/streampu checkout $(git -C lib/pystreampu/lib/streampu rev-parse HEAD)
 ```
 
 > [!IMPORTANT]
 > **Single Shared `StreamPU` ABI Rule:**
 > Because `pyStreamPU` (`streampu`) and `py_aff3ct` exchange C++ pointers (`spu::module::Module`, `spu::runtime::Sequence`, `spu::runtime::Pipeline`, `spu::runtime::Task`, `spu::runtime::Socket`) inside the same Python process, **both extensions must be compiled against the exact same `StreamPU` headers and library installed in `aff3ct_install/`** (`INCLUDE_SPU_LIB=OFF`).
-> Before compiling, make sure `lib/aff3ct/lib/streampu` and `lib/pystreampu/lib/streampu` are on the same `StreamPU` commit:
+> The commands above ensure that `lib/aff3ct` builds and installs the exact `StreamPU` commit expected by `lib/pystreampu`. You can verify at any time that both point to the same commit with:
 > ```bash
 > git -C lib/pystreampu/lib/streampu rev-parse HEAD
 > git -C lib/aff3ct/lib/streampu rev-parse HEAD
