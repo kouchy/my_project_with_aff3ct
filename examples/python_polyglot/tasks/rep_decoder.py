@@ -94,6 +94,74 @@ def _vstore16_hard_decision(typingctx, v_k_2d, row, col, s_vec):
     return sig, codegen
 
 
+def _tuple_to_vec8(builder, tup_val):
+    vty = ir.VectorType(ir.FloatType(), 8)
+    vec = ir.Constant(vty, ir.Undefined)
+    i32 = ir.IntType(32)
+    for i in range(8):
+        el = builder.extract_value(tup_val, i)
+        vec = builder.insert_element(vec, el, ir.Constant(i32, i))
+    return vec
+
+
+def _vec8_to_tuple(builder, vec_val):
+    aty = ir.ArrayType(ir.FloatType(), 8)
+    res = ir.Constant(aty, ir.Undefined)
+    i32 = ir.IntType(32)
+    for i in range(8):
+        el = builder.extract_element(vec_val, ir.Constant(i32, i))
+        res = builder.insert_value(res, el, i)
+    return res
+
+
+@intrinsic
+def _vload8_f32(typingctx, arr_2d, row, col):
+    sig = types.UniTuple(types.float32, 8)(arr_2d, types.intp, types.intp)
+
+    def codegen(context, builder, signature, args):
+        data_ptr = builder.extract_value(args[0], 4)
+        ncols = builder.extract_value(args[0], [5, 1])
+        idx = builder.add(builder.mul(args[1], ncols), args[2])
+        ptr = builder.gep(data_ptr, [idx])
+        vty = ir.VectorType(ir.FloatType(), 8)
+        vec = builder.load(builder.bitcast(ptr, vty.as_pointer()), align=4)
+        return _vec8_to_tuple(builder, vec)
+
+    return sig, codegen
+
+
+@intrinsic
+def _vfadd8(typingctx, a, b):
+    sig = a(a, b)
+
+    def codegen(context, builder, signature, args):
+        va = _tuple_to_vec8(builder, args[0])
+        vb = _tuple_to_vec8(builder, args[1])
+        res = builder.fadd(va, vb, flags=["fast"])
+        return _vec8_to_tuple(builder, res)
+
+    return sig, codegen
+
+
+@intrinsic
+def _vstore8_hard_decision(typingctx, v_k_2d, row, col, s_vec):
+    sig = types.none(v_k_2d, types.intp, types.intp, s_vec)
+
+    def codegen(context, builder, signature, args):
+        data_ptr = builder.extract_value(args[0], 4)
+        ncols = builder.extract_value(args[0], [5, 1])
+        idx = builder.add(builder.mul(args[1], ncols), args[2])
+        ptr = builder.gep(data_ptr, [idx])
+        vs = _tuple_to_vec8(builder, args[3])
+        vzero = ir.Constant(ir.VectorType(ir.FloatType(), 8), [ir.Constant(ir.FloatType(), 0.0)] * 8)
+        cmp = builder.fcmp_ordered("<", vs, vzero, flags=["fast"])
+        vi32 = builder.zext(cmp, ir.VectorType(ir.IntType(32), 8))
+        builder.store(vi32, builder.bitcast(ptr, ir.VectorType(ir.IntType(32), 8).as_pointer()), align=4)
+        return context.get_dummy_value()
+
+    return sig, codegen
+
+
 # ==================================================================================================
 # v0: Naive idiomatic implementation (allocates `ext` and slices on the heap every frame)
 # ==================================================================================================
@@ -167,6 +235,12 @@ def _decode_rep_frame_buf_simd(Y_N, V_K, f, K, n_rep):
             s = _vfadd16(s, _vload16_f32(Y_N, f, r * K + i))
         _vstore16_hard_decision(V_K, f, i, s)
         i += 16
+    while i + 8 <= K:
+        s8 = _vload8_f32(Y_N, f, i)
+        for r in range(1, n_rep):
+            s8 = _vfadd8(s8, _vload8_f32(Y_N, f, r * K + i))
+        _vstore8_hard_decision(V_K, f, i, s8)
+        i += 8
     while i < K:
         acc = Y_N[f, i]
         for r in range(1, n_rep):

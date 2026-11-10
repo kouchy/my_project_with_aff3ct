@@ -557,6 +557,102 @@ using Monitor_BFER_reduction = aff3ct::tools::Monitor_reduction<Monitor_BFER_int
 using Monitor_BFER_i16 = aff3ct::module::Monitor_BFER<int16_t>;
 using Monitor_BFER_reduction_i16 = aff3ct::tools::Monitor_reduction<Monitor_BFER_i16>;
 
+// Subclass of Source_random_fast<B> that safely handles sub-register frame sizes (e.g. K = 8 on AVX-512
+// with F > 1, where odd frames sit at a 32-byte offset and are not 64-byte aligned).
+template<typename B>
+class Source_random_fast_any : public aff3ct::module::Source_random_fast<B>
+{
+  private:
+    aff3ct::tools::PRNG_MT19937 mt19937_fallback_;
+
+  public:
+    Source_random_fast_any(const int K, const int seed = 0)
+      : aff3ct::module::Source_random_fast<B>(K, seed)
+      , mt19937_fallback_(seed)
+    {
+    }
+
+    virtual Source_random_fast_any<B>* clone() const override
+    {
+        auto m = new Source_random_fast_any(*this);
+        m->deep_copy(*this);
+        return m;
+    }
+
+    virtual void set_seed(const int seed) override
+    {
+        aff3ct::module::Source_random_fast<B>::set_seed(seed);
+        this->mt19937_fallback_.seed(seed);
+    }
+
+  protected:
+    virtual void _generate(B* U_K, const size_t frame_id) override
+    {
+        if (mipp::isAligned(U_K))
+        {
+            aff3ct::module::Source_random_fast<B>::_generate(U_K, frame_id);
+            return;
+        }
+        const auto size = static_cast<unsigned>(this->max_data_size);
+        for (unsigned i = 0; i < size; i += sizeof(B) * 8)
+        {
+            auto randoms = this->mt19937_fallback_.rand_u32();
+            unsigned j = 0;
+            while ((j < sizeof(B) * 8) && (i + j < size))
+            {
+                U_K[i + j] = static_cast<B>(randoms & 0x1);
+                randoms >>= 1;
+                j++;
+            }
+        }
+    }
+};
+
+// Subclass of Decoder_repetition<B, R> that matches Decoder_repetition_fast<B, R> when K >= mipp::nElReg<R>(),
+// and also supports ultra-short block lengths K < mipp::nElReg<R>() (such as K = 8 on AVX-512 where nElReg = 16).
+template<typename B, typename R>
+class Decoder_repetition_fast_any : public aff3ct::module::Decoder_repetition<B, R>
+{
+  public:
+    Decoder_repetition_fast_any(const int& K, const int& N, const bool buffered_encoding = true)
+      : aff3ct::module::Decoder_repetition<B, R>(K, N, buffered_encoding)
+    {
+        const std::string name = "Decoder_repetition_fast";
+        this->set_name(name);
+        for (auto& t : this->tasks)
+            t->set_replicability(true);
+    }
+
+    virtual Decoder_repetition_fast_any<B, R>* clone() const override
+    {
+        auto m = new Decoder_repetition_fast_any(*this);
+        m->deep_copy(*this);
+        return m;
+    }
+
+  protected:
+    virtual int _decode_siso_alt(const R* sys, const R* par, R* ext, const size_t /*frame_id*/) override
+    {
+        const int n_el = mipp::nElReg<R>();
+        const int vec_end = (this->K / n_el) * n_el;
+        for (auto i = 0; i < vec_end; i += n_el)
+        {
+            auto r_ext = mipp::Reg<R>(&sys[i]);
+            for (auto j = 0; j < this->rep_count; j++)
+                r_ext += &par[j * this->K + i];
+            r_ext.store(&ext[i]);
+        }
+        for (auto i = vec_end; i < this->K; i++)
+        {
+            R s = sys[i];
+            for (auto j = 0; j < this->rep_count; j++)
+                s += par[j * this->K + i];
+            ext[i] = s;
+        }
+        return 0;
+    }
+};
+
 } // namespace
 
 PYBIND11_MODULE(py_aff3ct, m, py::mod_gil_not_used())
@@ -585,6 +681,16 @@ PYBIND11_MODULE(py_aff3ct, m, py::mod_gil_not_used())
       "Convert Es/N0 (dB) to AWGN standard deviation sigma.");
 
     m.def(
+      "mipp_nElReg_f32",
+      []() { return static_cast<int>(mipp::nElReg<float>()); },
+      "Return the native SIMD register width in elements for float32.");
+
+    m.def(
+      "mipp_nElReg_i16",
+      []() { return static_cast<int>(mipp::nElReg<int16_t>()); },
+      "Return the native SIMD register width in elements for int16_t.");
+
+    m.def(
       "set_single_wave",
       [](spu::module::Module& mdl, const bool enable)
       {
@@ -606,13 +712,13 @@ PYBIND11_MODULE(py_aff3ct, m, py::mod_gil_not_used())
       .def("bind", &Sigma_buffer::bind, "socket"_a);
 
     // --- Source_random_fast (32-bit and 16-bit) ---
-    py::class_<aff3ct::module::Source_random_fast<int>, spu::module::Source<int>>(m, "Source_random_fast")
+    py::class_<Source_random_fast_any<int>, spu::module::Source<int>>(m, "Source_random_fast")
       .def(py::init<const int, const int>(), "K"_a, "seed"_a = 0)
-      .def("set_seed", &aff3ct::module::Source_random_fast<int>::set_seed, "seed"_a);
+      .def("set_seed", &Source_random_fast_any<int>::set_seed, "seed"_a);
 
-    py::class_<aff3ct::module::Source_random_fast<int16_t>, spu::module::Source<int16_t>>(m, "Source_random_fast_i16")
+    py::class_<Source_random_fast_any<int16_t>, spu::module::Source<int16_t>>(m, "Source_random_fast_i16")
       .def(py::init<const int, const int>(), "K"_a, "seed"_a = 0)
-      .def("set_seed", &aff3ct::module::Source_random_fast<int16_t>::set_seed, "seed"_a);
+      .def("set_seed", &Source_random_fast_any<int16_t>::set_seed, "seed"_a);
 
     // --- Repetition Codec ---
     py::class_<aff3ct::module::Encoder_repetition_sys<int>, spu::module::Stateful>(m, "Encoder_repetition_sys")
@@ -623,7 +729,7 @@ PYBIND11_MODULE(py_aff3ct, m, py::mod_gil_not_used())
                spu::tools::Interface_reset>(m, "Decoder_repetition_std")
       .def(py::init<const int&, const int&, const bool>(), "K"_a, "N"_a, "buffered_encoding"_a = true);
 
-    py::class_<aff3ct::module::Decoder_repetition_fast<int, float>,
+    py::class_<Decoder_repetition_fast_any<int, float>,
                spu::module::Stateful,
                spu::tools::Interface_reset>(m, "Decoder_repetition_fast")
       .def(py::init<const int&, const int&, const bool>(), "K"_a, "N"_a, "buffered_encoding"_a = true);
@@ -1005,4 +1111,22 @@ PYBIND11_MODULE(py_aff3ct, m, py::mod_gil_not_used())
       "max_frame"_a = 0,
       "n_frames"_a = 1,
       "Execute a 3-stage Pipeline (int16) until monitor/frame limit is reached and return elapsed time in microseconds.");
+
+    m.def(
+      "thread_pinning_init",
+      []()
+      {
+          if (!spu::tools::Thread_pinning::is_init())
+              spu::tools::Thread_pinning::init();
+      },
+      "Initialize hwloc Thread_pinning if not already initialized.");
+
+    m.def(
+      "thread_pinning_destroy",
+      []()
+      {
+          if (spu::tools::Thread_pinning::is_init())
+              spu::tools::Thread_pinning::destroy();
+      },
+      "Destroy hwloc Thread_pinning if initialized.");
 }

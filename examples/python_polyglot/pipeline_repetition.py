@@ -110,6 +110,10 @@ def parse_args():
     p.add_argument("--sim-sequence", action="store_true", help="Run a replicated Sequence instead of 3-stage Pipeline")
     p.add_argument("--sim-interstage-buf", type=int, default=0, help="Pipeline inter-stage buffer size")
     p.add_argument("--sim-active-waiting", action="store_true", help="Enable active waiting on inter-stage buffers")
+    p.add_argument("--sim-pin-threads", action="store_true", help="Pin pipeline/sequence threads to physical CPU cores via hwloc")
+    p.add_argument("--sim-warmup", type=int, default=0, help="Number of warmup frames before timed execution")
+    p.add_argument("--sim-rt-stats", action="store_true", help="Run a 2nd pass with hardware cycle-counter RT latency/jitter stats")
+    p.add_argument("--sim-rt-skip", type=int, default=64, help="Number of initial waves to skip in RT stats pass")
     p.add_argument("--sim-stats", action="store_true", help="Enable per-task statistics")
     p.add_argument("-v", "--sim-verbose", action="store_true", help="Print # Exec_stats line per SNR")
     p.add_argument("--sim-dot", type=str, default="", help="Export Graphviz .dot file")
@@ -190,14 +194,24 @@ def main():
     print(f"# Decoder backend: {dec_desc}")
     print("#----------------------------------------------------------")
 
+    if args.sim_pin_threads:
+        py_aff3ct.thread_pinning_init()
+
     if args.sim_sequence:
-        runtime = spu.Sequence(source["generate"], n_threads)
+        runtime = spu.Sequence(
+            source["generate"],
+            n_threads,
+            thread_pinning=args.sim_pin_threads,
+            sequence_pinning_policy="; ".join(f"PU_{i}" for i in range(n_threads)) if args.sim_pin_threads else "",
+        )
         cloned_monitors = runtime.get_cloned_modules(monitor)
         monitor_red = py_aff3ct.Monitor_BFER_reduction(cloned_monitors)
         monitor_red.set_reduce_frequency_ms(1)
         if args.sim_dot:
             runtime.export_dot(args.sim_dot)
     else:
+        pin_flags = [True, True, True] if args.sim_pin_threads else [False, False, False]
+        pin_puids = [[0], list(range(1, 1 + n_threads)), [1 + n_threads]] if args.sim_pin_threads else []
         runtime = spu.Pipeline(
             [source["generate"]],
             [monitor["check_errors"], sink["send_count"]],
@@ -209,6 +223,8 @@ def main():
             [1, n_threads, 1],
             [eff_buf, eff_buf],
             [args.sim_active_waiting, args.sim_active_waiting],
+            pin_flags,
+            pin_puids,
         )
         monitor_red = None
         if args.sim_dot:
@@ -219,6 +235,14 @@ def main():
     else:
         py_aff3ct.configure_pipeline_tasks(runtime, args.sim_stats)
 
+    if args.sim_warmup > 0 and not args.sim_sequence:
+        py_aff3ct.seed_pipeline_modules(runtime)
+        esn0_w = py_aff3ct.ebn0_to_esn0(args.ebn0_min, R, 1)
+        sigma_buf.set_sigma(py_aff3ct.esn0_to_sigma(esn0_w, 1))
+        runtime.set_rt_stats(False)
+        py_aff3ct.exec_pipeline(runtime, monitor, source, args.sim_warmup, n_frames)
+        py_aff3ct.reset_pipeline_modules(runtime)
+
     print("#  Eb/N0 |   Es/N0 |        FRA |         BE |         FE |        BER |        FER |  SIM_CTHR")
     print("#   (dB) |    (dB) |            |            |            |            |            |    (Mb/s)")
 
@@ -228,6 +252,7 @@ def main():
             py_aff3ct.seed_sequence_modules(runtime)
         else:
             py_aff3ct.seed_pipeline_modules(runtime)
+            runtime.set_rt_stats(False)
 
         esn0 = py_aff3ct.ebn0_to_esn0(ebn0, R, 1)
         sigma = py_aff3ct.esn0_to_sigma(esn0, 1)
@@ -260,6 +285,35 @@ def main():
             print(
                 f"# Exec_stats: ebn0={ebn0:.2f} fra={n_fra} elapsed_us={elapsed_us:.3f} "
                 f"info_thr_mbps={info_thr_mbps:.6f} coded_thr_mbps={coded_thr_mbps:.6f}"
+            )
+
+        if args.sim_rt_stats and not args.sim_sequence:
+            py_aff3ct.reset_pipeline_modules(runtime)
+            py_aff3ct.seed_pipeline_modules(runtime)
+            runtime.reset_rt_stats()
+            eff_rt_skip = min(args.sim_rt_skip, max(2, (n_fra // max(1, n_frames * n_threads)) // 4))
+            runtime.set_rt_stats(True, eff_rt_skip)
+            py_aff3ct.exec_pipeline(runtime, monitor, source, args.mnt_max_fra, n_frames)
+            rt = runtime.get_rt_stats()
+            runtime.set_rt_stats(False)
+            stgs = rt["stages"]
+            s0 = stgs[0] if len(stgs) > 0 else {}
+            s1 = stgs[1] if len(stgs) > 1 else {}
+            s2 = stgs[2] if len(stgs) > 2 else {}
+            print(
+                f"# Rt_stats: ebn0={ebn0:.2f} e2e_calls={rt.get('e2e_n_calls', 0)} "
+                f"e2e_avg_ns={rt.get('e2e_avg_ns', 0.0):.2f} e2e_std_ns={rt.get('e2e_std_ns', 0.0):.2f} "
+                f"e2e_p10_ns={rt.get('e2e_p10_ns', 0.0):.2f} e2e_p25_ns={rt.get('e2e_p25_ns', 0.0):.2f} "
+                f"e2e_p50_ns={rt.get('e2e_p50_ns', 0.0):.2f} e2e_p75_ns={rt.get('e2e_p75_ns', 0.0):.2f} "
+                f"e2e_p90_ns={rt.get('e2e_p90_ns', 0.0):.2f} e2e_p99_ns={rt.get('e2e_p99_ns', 0.0):.2f} "
+                f"e2e_p999_ns={rt.get('e2e_p999_ns', 0.0):.2f} e2e_max_ns={rt.get('e2e_max_ns', 0.0):.2f} "
+                f"stg0_avg_ns={s0.get('avg_ns', 0.0):.2f} stg0_p50_ns={s0.get('p50_ns', 0.0):.2f} stg0_p99_ns={s0.get('p99_ns', 0.0):.2f} "
+                f"stg1_calls={s1.get('n_calls', 0)} stg1_avg_ns={s1.get('avg_ns', 0.0):.2f} stg1_std_ns={s1.get('std_ns', 0.0):.2f} "
+                f"stg1_p10_ns={s1.get('p10_ns', 0.0):.2f} stg1_p25_ns={s1.get('p25_ns', 0.0):.2f} "
+                f"stg1_p50_ns={s1.get('p50_ns', 0.0):.2f} stg1_p75_ns={s1.get('p75_ns', 0.0):.2f} "
+                f"stg1_p90_ns={s1.get('p90_ns', 0.0):.2f} stg1_p99_ns={s1.get('p99_ns', 0.0):.2f} "
+                f"stg1_p999_ns={s1.get('p999_ns', 0.0):.2f} stg1_max_ns={s1.get('max_ns', 0.0):.2f} "
+                f"stg2_avg_ns={s2.get('avg_ns', 0.0):.2f} stg2_p50_ns={s2.get('p50_ns', 0.0):.2f} stg2_p99_ns={s2.get('p99_ns', 0.0):.2f}"
             )
 
         if args.sim_sequence:

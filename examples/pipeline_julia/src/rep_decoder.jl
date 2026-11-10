@@ -110,6 +110,17 @@ end
         @nexprs 16 w -> (V_K[v_base + w] = ifelse(s_w < 0.0f0, Int32(1), Int32(0)))
         i += 16
     end
+    @inbounds while i + 7 <= K
+        y_base = y_off + i - 1
+        @nexprs 8 w -> (s_w = Y_N[y_base + w])
+        for r in 1:(n_rep - 1)
+            r_base = y_base + r * K
+            @nexprs 8 w -> (s_w += Y_N[r_base + w])
+        end
+        v_base = v_off + i - 1
+        @nexprs 8 w -> (V_K[v_base + w] = ifelse(s_w < 0.0f0, Int32(1), Int32(0)))
+        i += 8
+    end
     @inbounds while i <= K
         s = Y_N[y_off + i]
         for r in 1:(n_rep - 1)
