@@ -29,6 +29,33 @@ using namespace py::literals;
 namespace
 {
 
+// Square Gray QAM modem (AFF3CT Modem_generic + Constellation_QAM) owning its constellation. AFF3CT's Modem_generic
+// only keeps a reference on the constellation: the holder base class is constructed first and outlives the modem
+// (clones keep referring to the constellation of the original module, which lives as long as the pipeline).
+// MAX = aff3ct::tools::max_star -> exact log-MAP demodulation (log-sum-exp over the constellation points),
+// MAX = aff3ct::tools::max      -> max-log approximation.
+struct QAM_constellation_holder
+{
+    aff3ct::tools::Constellation_QAM<float> owned_cstl;
+    explicit QAM_constellation_holder(const unsigned bps)
+      : owned_cstl(bps)
+    {
+    }
+};
+
+template<typename B, aff3ct::tools::proto_max<float> MAX>
+class Modem_QAM_owned
+  : private QAM_constellation_holder
+  , public aff3ct::module::Modem_generic<B, float, float, MAX>
+{
+  public:
+    Modem_QAM_owned(const int N, const unsigned bps)
+      : QAM_constellation_holder(bps)
+      , aff3ct::module::Modem_generic<B, float, float, MAX>(N, QAM_constellation_holder::owned_cstl)
+    {
+    }
+};
+
 // Constant parameter buffer for the channel/modem 'CP' (sigma) input sockets.
 // Binds a raw C++ buffer directly to an input socket (just like `(*channel)["add_noise::CP"] = sigma` in C++),
 // avoiding any extra upstream task in a multi-stage Pipeline.
@@ -789,6 +816,32 @@ PYBIND11_MODULE(py_aff3ct, m, py::mod_gil_not_used())
 
     py::class_<aff3ct::module::Modem_BPSK_fast<int16_t, float, float>, spu::module::Stateful>(m, "Modem_BPSK_fast_i16")
       .def(py::init<const int, const bool>(), "N"_a, "disable_sig2"_a = false);
+
+    // --- Square Gray QAM modems (exact log-MAP or max-log demodulation), 32-bit and 16-bit bits ---
+    py::class_<Modem_QAM_owned<int, aff3ct::tools::max_star<float>>, spu::module::Stateful>(m, "Modem_QAM_logmap")
+      .def(py::init<const int, const unsigned>(), "N"_a, "bps"_a = 4);
+    py::class_<Modem_QAM_owned<int, aff3ct::tools::max<float>>, spu::module::Stateful>(m, "Modem_QAM_maxlog")
+      .def(py::init<const int, const unsigned>(), "N"_a, "bps"_a = 4);
+    py::class_<Modem_QAM_owned<int16_t, aff3ct::tools::max_star<float>>, spu::module::Stateful>(m,
+                                                                                               "Modem_QAM_logmap_i16")
+      .def(py::init<const int, const unsigned>(), "N"_a, "bps"_a = 4);
+    py::class_<Modem_QAM_owned<int16_t, aff3ct::tools::max<float>>, spu::module::Stateful>(m, "Modem_QAM_maxlog_i16")
+      .def(py::init<const int, const unsigned>(), "N"_a, "bps"_a = 4);
+    m.def(
+      "qam_constellation",
+      [](const unsigned bps)
+      {
+          aff3ct::tools::Constellation_QAM<float> c(bps);
+          std::vector<float> re, im;
+          for (unsigned j = 0; j < c.get_n_symbols(); j++)
+          {
+              re.push_back(c[j].real());
+              im.push_back(c[j].imag());
+          }
+          return py::make_tuple(re, im);
+      },
+      "bps"_a,
+      "Points (real, imag) of AFF3CT's square Gray QAM constellation, indexed by the symbol bits (LSB = first bit).");
 
     // --- Quantizer Pow2 Fast (float -> int16_t) ---
     py::class_<aff3ct::module::Quantizer_pow2_fast<float, int16_t>, spu::module::Stateful>(m, "Quantizer_pow2_fast_i16")

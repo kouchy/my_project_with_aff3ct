@@ -166,6 +166,13 @@ def parse_args():
                    help="Pipeline split: source = [source | enc..dec | monitor]; frontend = [source..channel | "
                         "demod..dec | monitor]; rx = receiver-only chain [antenna replay | demod..dec | monitor]: "
                         "the noisy frames are generated once by the transmitter and replayed from a ring buffer")
+    p.add_argument("--mod", type=str, default="BPSK", choices=["BPSK", "QAM16", "QAM64", "QAM256"],
+                   help="Modulation (5G NR PUSCH: QPSK..256QAM; square Gray QAM from AFF3CT's Constellation_QAM)")
+    p.add_argument("--demod", type=str, default="LOGMAP", choices=["LOGMAP", "MAXLOG"],
+                   help="QAM demodulation: exact log-MAP (log-sum-exp over the constellation) or max-log")
+    p.add_argument("--demod-numba", action="store_true",
+                   help="Mixed-language receiver: Python/Numba demodulator followed by the decoder in the replicated "
+                        "stage (instead of the C++ AFF3CT demodulator)")
     p.add_argument("--rx-buffer-mib", type=float, default=64.0,
                    help="Size of the replayed channel-sample ring buffer for --stage-split rx (MiB, > last-level cache)")
     p.add_argument("--sim-pin-threads", action="store_true", help="Pin threads to physical CPU cores via hwloc")
@@ -275,14 +282,23 @@ def main():
         )
         K, N_cw, N = code.K, code.N_cw, code.N
         R = float(K) / float(N)
+        bps = {"BPSK": 1, "QAM16": 4, "QAM64": 6, "QAM256": 8}[args.mod]
+        # channel samples per frame: N real values (BPSK), 2 * ceil(N / bps) (I/Q) for QAM
+        N_mod = N if bps == 1 else 2 * ((N + bps - 1) // bps)
+
+        def make_modem(n, i16):
+            if bps == 1:
+                return py_aff3ct.Modem_BPSK_fast_i16(n) if i16 else py_aff3ct.Modem_BPSK_fast(n)
+            name = ("Modem_QAM_logmap" if args.demod == "LOGMAP" else "Modem_QAM_maxlog") + ("_i16" if i16 else "")
+            return getattr(py_aff3ct, name)(n, bps)
 
         # Instantiate C++ / Julia / Python modules
         if is_i16:
             source = py_aff3ct.Source_random_fast_i16(K)
             encoder = code.build_encoder_i16()
             puncturer = code.build_puncturer_i16()
-            modem = py_aff3ct.Modem_BPSK_fast_i16(N)
-            channel = py_aff3ct.Channel_AWGN_LLR(N, "FAST")
+            modem = make_modem(N, True)
+            channel = py_aff3ct.Channel_AWGN_LLR(N_mod, "FAST")
             quantizer = code.build_quantizer_i16(args.qnt_dec, args.qnt_bits)
             monitor = py_aff3ct.Monitor_BFER_i16(K, args.max_fe, args.mnt_max_fra)
             sink = spu.sink_no(K, dtype=spu.int16)
@@ -290,8 +306,8 @@ def main():
             source = py_aff3ct.Source_random_fast(K)
             encoder = code.build_encoder()
             puncturer = code.build_puncturer()
-            modem = py_aff3ct.Modem_BPSK_fast(N)
-            channel = py_aff3ct.Channel_AWGN_LLR(N, "FAST")
+            modem = make_modem(N, False)
+            channel = py_aff3ct.Channel_AWGN_LLR(N_mod, "FAST")
             quantizer = None
             monitor = py_aff3ct.Monitor_BFER(K, args.max_fe, args.mnt_max_fra)
             sink = spu.sink_no(K, dtype=spu.int32)
@@ -301,13 +317,13 @@ def main():
             # antenna buffer; separate puncturer/modem instances are used on the transmit side.
             rx_bytes = int(args.rx_buffer_mib * (1 << 20))
             if is_i16:
-                antenna = py_aff3ct.Antenna_replay_i16(K, N, rx_bytes)
+                antenna = py_aff3ct.Antenna_replay_i16(K, N_mod, rx_bytes)
                 puncturer_tx = code.build_puncturer_i16()
-                modem_tx = py_aff3ct.Modem_BPSK_fast_i16(N)
+                modem_tx = make_modem(N, True)
             else:
-                antenna = py_aff3ct.Antenna_replay(K, N, rx_bytes)
+                antenna = py_aff3ct.Antenna_replay(K, N_mod, rx_bytes)
                 puncturer_tx = code.build_puncturer()
-                modem_tx = py_aff3ct.Modem_BPSK_fast(N)
+                modem_tx = make_modem(N, False)
     finally:
         os.chdir(orig_cwd)
 
@@ -381,9 +397,24 @@ def main():
             )
         dec_desc = f"C++ AFF3CT ({args.dec_type} {base_rule} {dtype_str}{simd_tag}, i={args.dec_ite})"
 
+    # receiver demodulator: C++ (AFF3CT) or Python/Numba (mixed-language receiver stage)
+    dem = modem
+    if args.demod_numba:
+        if bps == 1:
+            from tasks.demod_numba import DemodBPSKNumba
+            dem = DemodBPSKNumba(N)
+        else:
+            from tasks.demod_qam_numba import DemodQAMNumba
+            dem = DemodQAMNumba(N, bps, args.demod == "LOGMAP")
+        dec_desc = f"Python/Numba {args.mod} demodulator + " + dec_desc
+    elif bps > 1:
+        dec_desc = f"C++ {args.mod} {args.demod} demodulator + " + dec_desc
+
     all_modules = [source, encoder, puncturer, modem, channel, decoder, monitor, sink]
     if quantizer is not None:
         all_modules.append(quantizer)
+    if dem is not modem:
+        all_modules.append(dem)
     if rx:
         all_modules += [antenna, puncturer_tx, modem_tx]
     for mdl in all_modules:
@@ -402,13 +433,13 @@ def main():
         antenna["record::Y_N"].bind(channel["add_noise::Y_N"])
         tx_tasks = [source["generate"], encoder["encode"], puncturer_tx["puncture"], modem_tx["modulate"], channel["add_noise"]]
         # receiver: antenna.receive -> demod [-> quantizer] -> depuncture -> decoder -> monitor
-        modem["demodulate::Y_N1"].bind(antenna["receive::Y_N"])
-        sigma_buf.bind(modem["demodulate::CP"])
+        dem["demodulate::Y_N1"].bind(antenna["receive::Y_N"])
+        sigma_buf.bind(dem["demodulate::CP"])
         if is_i16:
-            quantizer["process::Y_N1"].bind(modem["demodulate::Y_N2"])
+            quantizer["process::Y_N1"].bind(dem["demodulate::Y_N2"])
             puncturer["depuncture::Y_N1"].bind(quantizer["process::Y_N2"])
         else:
-            puncturer["depuncture::Y_N1"].bind(modem["demodulate::Y_N2"])
+            puncturer["depuncture::Y_N1"].bind(dem["demodulate::Y_N2"])
         decoder["decode_siho::Y_N"].bind(puncturer["depuncture::Y_N2"])
         monitor["check_errors::U"].bind(antenna["receive::U_K"])
         monitor["check_errors::V"].bind(decoder["decode_siho::V_K"])
@@ -418,13 +449,13 @@ def main():
         modem["modulate::X_N1"].bind(puncturer["puncture::X_N2"])
         channel["add_noise::X_N"].bind(modem["modulate::X_N2"])
         sigma_buf.bind(channel["add_noise::CP"])
-        modem["demodulate::Y_N1"].bind(channel["add_noise::Y_N"])
-        sigma_buf.bind(modem["demodulate::CP"])
+        dem["demodulate::Y_N1"].bind(channel["add_noise::Y_N"])
+        sigma_buf.bind(dem["demodulate::CP"])
         if is_i16:
-            quantizer["process::Y_N1"].bind(modem["demodulate::Y_N2"])
+            quantizer["process::Y_N1"].bind(dem["demodulate::Y_N2"])
             puncturer["depuncture::Y_N1"].bind(quantizer["process::Y_N2"])
         else:
-            puncturer["depuncture::Y_N1"].bind(modem["demodulate::Y_N2"])
+            puncturer["depuncture::Y_N1"].bind(dem["demodulate::Y_N2"])
         decoder["decode_siho::Y_N"].bind(puncturer["depuncture::Y_N2"])
         monitor["check_errors::U"].bind(source["generate::out_data"])
         monitor["check_errors::V"].bind(decoder["decode_siho::V_K"])
@@ -473,14 +504,14 @@ def main():
             p_first, p_last = [antenna["receive"]], [monitor["check_errors"]]
             p_stages = [
                 [[antenna["receive"]], [antenna["receive"]], []],
-                [[modem["demodulate"]], [decoder["decode_siho"]], []],
+                [[dem["demodulate"]], [decoder["decode_siho"]], []],
                 [[monitor["check_errors"]], [], []],
             ]
         else:
             p_first, p_last = [source["generate"]], [monitor["check_errors"], sink["send_count"]]
             p_stages = [
                 [[source["generate"]], [source["generate"]] if args.stage_split == "source" else [channel["add_noise"]], []],
-                [[encoder["encode"]] if args.stage_split == "source" else [modem["demodulate"]], [decoder["decode_siho"]], []],
+                [[encoder["encode"]] if args.stage_split == "source" else [dem["demodulate"]], [decoder["decode_siho"]], []],
                 [[monitor["check_errors"], sink["send_count"]], [], []],
             ]
         runtime = spu.Pipeline(
@@ -521,7 +552,7 @@ def main():
 
     if args.sim_warmup > 0 and not args.sim_sequence:
         py_aff3ct.seed_pipeline_modules(runtime)
-        esn0_w = py_aff3ct.ebn0_to_esn0(args.ebn0_min, R, 1)
+        esn0_w = py_aff3ct.ebn0_to_esn0(args.ebn0_min, R, bps)
         set_sigma(py_aff3ct.esn0_to_sigma(esn0_w, 1))
         runtime.set_rt_stats(False)
         if is_i16:
@@ -541,7 +572,7 @@ def main():
             py_aff3ct.seed_pipeline_modules(runtime)
             runtime.set_rt_stats(False)
 
-        esn0 = py_aff3ct.ebn0_to_esn0(ebn0, R, 1)
+        esn0 = py_aff3ct.ebn0_to_esn0(ebn0, R, bps)
         sigma = py_aff3ct.esn0_to_sigma(esn0, 1)
         set_sigma(sigma)
 
