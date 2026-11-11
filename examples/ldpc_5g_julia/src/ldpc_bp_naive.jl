@@ -7,6 +7,7 @@
 #     schedules with Sum-Product (`SPA`) and Offset Min-Sum (`OMS`) check-node updates.
 #   - In inter-frame mode (`INTER`, W frames per wave), simply loops sequentially over each frame `w in 1:W`.
 
+# LOC80-BEGIN JL_NAIVE.module
 struct LDPC_Graph{T<:Union{Float32, Int16}}
     schedule::Symbol
     rule::Symbol
@@ -21,7 +22,9 @@ struct LDPC_Graph{T<:Union{Float32, Int16}}
     chk_to_var::Vector{Int}
     info_bits_pos::Vector{Int}
 end
+# LOC80-END JL_NAIVE.module
 
+# LOC80-BEGIN JL_NAIVE.module
 function LDPC_Graph(
     sched_sym::Symbol, rule_sym::Symbol, ::Type{T},
     offset_val::Real, sat_val_in::Real,
@@ -78,6 +81,7 @@ function LDPC_Graph(
         var_edges, chk_edges, transpose, chk_to_var, info_bits_pos
     )
 end
+# LOC80-END JL_NAIVE.module
 
 function LDPC_Graph(
     n_ite::Int32, enable_syndrome::Bool, syndrome_depth::Int32,
@@ -89,6 +93,7 @@ function LDPC_Graph(
         h_cols_addr, h_cols_len, info_bits_addr, K)
 end
 
+# LOC80-BEGIN JL_NAIVE.module
 mutable struct LDPC_Workspace{T<:Union{Float32, Int16}}
     msg_chk_to_var::Vector{T}
     msg_var_to_chk::Vector{T}
@@ -100,10 +105,12 @@ function LDPC_Workspace(
 ) where {T<:Union{Float32, Int16}}
     return LDPC_Workspace{T}(zeros(T, Int(n_branches)), zeros(T, Int(n_branches)), zeros(T, Int(n_var_nodes)))
 end
+# LOC80-END JL_NAIVE.module
 
 LDPC_Workspace(nv::Int32, nb::Int32, mc::Int32) = LDPC_Workspace(:SCALAR, Float32, nv, nb, mc)
 
 # Saturating helpers (no-op for Float32, symmetric clamping for Int16)
+# LOC80-BEGIN JL_NAIVE
 _widen(x::Float32) = x
 _widen(x::Int16)   = Int32(x)
 _sat(x::Float32, ::Float32)  = x
@@ -117,6 +124,7 @@ _sub(a::Int16,   b::Int16)   = _sat(Int32(a) - Int32(b), typemax(Int16))
 function _check_node_update(v2c::Vector{T}, rule::Symbol, offset::T, sat_val::T) where {T}
     deg = length(v2c)
     c2v = Vector{T}(undef, deg)
+    # LOC80-END JL_NAIVE
     if rule === :SPA
         max_tanh = 1.0f0 - eps(Float32)
         t_vals   = [tanh(abs(Float32(x)) * 0.5f0) for x in v2c]
@@ -133,6 +141,7 @@ function _check_node_update(v2c::Vector{T}, rule::Symbol, offset::T, sat_val::T)
             c2v[i] = T(sgn_ext ? -mag : mag)
         end
     else # Offset Min-Sum (OMS)
+        # LOC80-BEGIN JL_NAIVE
         mags    = abs.(v2c)
         tot_sgn = reduce(⊻, (x < zero(T) for x in v2c); init = false)
         for i in 1:deg
@@ -141,9 +150,12 @@ function _check_node_update(v2c::Vector{T}, rule::Symbol, offset::T, sat_val::T)
             sgn     = tot_sgn ⊻ (v2c[i] < zero(T))
             c2v[i]  = _sat(sgn ? -mag : mag, sat_val)
         end
+        # LOC80-END JL_NAIVE
     end
+    # LOC80-BEGIN JL_NAIVE
     return c2v
 end
+# LOC80-END JL_NAIVE
 
 function _check_syndrome(graph::LDPC_Graph{T}, post::Vector{T}) where {T}
     for edges in graph.chk_edges
@@ -153,6 +165,7 @@ function _check_syndrome(graph::LDPC_Graph{T}, post::Vector{T}) where {T}
     return true
 end
 
+# LOC80-BEGIN JL_NAIVE
 function _decode_single_frame!(
     graph::LDPC_Graph{T}, work::LDPC_Workspace{T},
     Y_N::AbstractVector{T}, V_K::AbstractVector{B}
@@ -163,6 +176,7 @@ function _decode_single_frame!(
     cur_depth, valid = 0, true
 
     for ite in 1:graph.n_ite
+    # LOC80-END JL_NAIVE
         if graph.schedule === :FLOODING
             # 1. Variable-node update
             for v in eachindex(graph.var_edges)
@@ -189,6 +203,7 @@ function _decode_single_frame!(
                 end
             end
         else # Horizontal Layered schedule
+            # LOC80-BEGIN JL_NAIVE
             for edges in graph.chk_edges
                 incoming = [_sub(post[graph.chk_to_var[k]], c2v[k]) for k in edges]
                 outgoing = _check_node_update(incoming, graph.rule, graph.offset, graph.sat_val)
@@ -198,6 +213,7 @@ function _decode_single_frame!(
                     post[u] = _add(incoming[idx], outgoing[idx], graph.sat_val)
                 end
             end
+            # LOC80-END JL_NAIVE
         end
 
         if graph.enable_syndrome && (graph.schedule === :LAYERED || ite != graph.n_ite)
@@ -206,6 +222,7 @@ function _decode_single_frame!(
             valid     = synd && (cur_depth == 0)
             valid && break
         end
+    # LOC80-BEGIN JL_NAIVE
     end
 
     for (i, pos) in enumerate(graph.info_bits_pos)
@@ -213,7 +230,9 @@ function _decode_single_frame!(
     end
     return valid
 end
+# LOC80-END JL_NAIVE
 
+# LOC80-BEGIN JL_NAIVE.module
 function decode_siho_julia(
     graph::LDPC_Graph{T}, work::LDPC_Workspace{T},
     sck_Y_N::AbstractVector{T}, sck_V_K::AbstractVector{B},
@@ -230,6 +249,7 @@ function decode_siho_julia(
     end
     return all_valid ? Int32(0) : Int32(1)
 end
+# LOC80-END JL_NAIVE.module
 
 # Ahead-of-execution compilation for Float32 and Int16 entry points
 precompile(decode_siho_julia, (LDPC_Graph{Float32}, LDPC_Workspace{Float32}, Vector{Float32}, Vector{Int32}, UInt32, UInt32))

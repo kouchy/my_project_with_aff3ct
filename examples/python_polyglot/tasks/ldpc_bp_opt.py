@@ -23,12 +23,14 @@ from numba.extending import intrinsic
 from llvmlite import ir
 
 
+# LOC80-BEGIN PY_OPT.common
 def _decl_intrinsic(builder, name, ret_ty, arg_tys):
     fnty = ir.FunctionType(ret_ty, arg_tys)
     try:
         return builder.module.get_global(name)
     except KeyError:
         return ir.Function(builder.module, fnty, name=name)
+        # LOC80-END PY_OPT.common
 
 
 # ====================================================================================================
@@ -49,6 +51,7 @@ def _bitcast_i32_to_f32(typingctx, x_ty):
     return types.float32(types.int32), codegen
 
 
+# LOC80-BEGIN PY_OPT_SCALAR
 @intrinsic
 def _sadd_sat_i16(typingctx, a_ty, b_ty):
     def codegen(context, builder, sig, args):
@@ -65,8 +68,10 @@ def _ssub_sat_i16(typingctx, a_ty, b_ty):
         fn = _decl_intrinsic(builder, "llvm.ssub.sat.i16", i16, [i16, i16])
         return builder.call(fn, [args[0], args[1]])
     return types.int16(types.int16, types.int16), codegen
+    # LOC80-END PY_OPT_SCALAR
 
 
+# LOC80-BEGIN PY_OPT_SCALAR
 @njit(nogil=True, fastmath=True, inline="always")
 def _clamp_sat_i16(x: np.int16, sat: np.int16) -> np.int16:
     neg_sat = np.int16(-sat)
@@ -75,6 +80,7 @@ def _clamp_sat_i16(x: np.int16, sat: np.int16) -> np.int16:
     if x < neg_sat:
         return neg_sat
     return x
+    # LOC80-END PY_OPT_SCALAR
 
 
 @njit(nogil=True, fastmath=True, inline="always")
@@ -164,6 +170,7 @@ def _atanh_cephes_f32(x: np.float32) -> np.float32:
     return _bitcast_i32_to_f32(_bitcast_f32_to_i32(y) | sgn_bit)
 
 
+# LOC80-BEGIN PY_OPT_SCALAR
 @njit(nogil=True, fastmath=True)
 def decode_siho_opt_scalar_f32(
     var_offsets: np.ndarray,
@@ -190,7 +197,9 @@ def decode_siho_opt_scalar_f32(
     n_chk = chk_offsets.shape[0] - 1
     Y_N = Y_N_wave[0]
     V_K = V_K_wave[0]
+    # LOC80-END PY_OPT_SCALAR
     max_tanh = np.float32(1.0) - np.float32(1.1920929e-7)
+    # LOC80-BEGIN PY_OPT_SCALAR
     inf_f32 = np.float32(3.4028235e38)
 
     c2v.fill(np.float32(0.0))
@@ -202,6 +211,7 @@ def decode_siho_opt_scalar_f32(
     valid = True
     ite_done = 0
     for ite in range(1, n_ite + 1):
+    # LOC80-END PY_OPT_SCALAR
         if not is_layered:
             for v in range(n_var):
                 e_start, e_stop = var_offsets[v], var_offsets[v + 1]
@@ -303,6 +313,7 @@ def decode_siho_opt_scalar_f32(
                         c2v[k] = new_msg
                         post[u] = np.float32(v_val + new_msg)
             else:
+                # LOC80-BEGIN PY_OPT_SCALAR
                 for c in range(n_chk):
                     k_start, k_stop = chk_offsets[c], chk_offsets[c + 1]
                     deg = k_stop - k_start
@@ -332,6 +343,7 @@ def decode_siho_opt_scalar_f32(
                         new_msg = -mag if s_out else mag
                         c2v[k] = new_msg
                         post[u] = np.float32(v_val + new_msg)
+                        # LOC80-END PY_OPT_SCALAR
 
         if enable_syndrome and (is_layered or ite != n_ite):
             if not is_layered:
@@ -363,11 +375,14 @@ def decode_siho_opt_scalar_f32(
                 acc = np.float32(acc + c2v[e])
             post[v] = acc
 
+    # LOC80-BEGIN PY_OPT_SCALAR
     for i in range(K):
         V_K[i] = np.int32(1) if post[info_bits_pos[i]] < np.float32(0.0) else np.int32(0)
     return 0 if valid else 1
+    # LOC80-END PY_OPT_SCALAR
 
 
+# LOC80-BEGIN PY_OPT_SCALAR
 @njit(nogil=True, fastmath=True)
 def decode_siho_opt_scalar_i16(
     var_offsets: np.ndarray,
@@ -404,6 +419,7 @@ def decode_siho_opt_scalar_i16(
     valid = True
     ite_done = 0
     for ite in range(1, n_ite + 1):
+    # LOC80-END PY_OPT_SCALAR
         if not is_layered:
             for v in range(n_var):
                 e_start, e_stop = var_offsets[v], var_offsets[v + 1]
@@ -436,6 +452,7 @@ def decode_siho_opt_scalar_i16(
                     s_out = (sng ^ v_val) < np.int16(0)
                     c2v[t_k] = _clamp_sat_i16(np.int16(-mag) if s_out else mag, sat_val)
         else:
+            # LOC80-BEGIN PY_OPT_SCALAR
             for c in range(n_chk):
                 k_start, k_stop = chk_offsets[c], chk_offsets[c + 1]
                 deg = k_stop - k_start
@@ -464,7 +481,8 @@ def decode_siho_opt_scalar_i16(
                     s_out = (sng ^ v_val) < np.int16(0)
                     new_msg = _clamp_sat_i16(np.int16(-mag) if s_out else mag, sat_val)
                     c2v[k] = new_msg
-                    post[u] = _add_sat_val_i16(v_val, new_msg, sat_val)
+                    post[u] = _sadd_sat_i16(v_val, new_msg)  # posterior: int16 saturation only (as AFF3CT/Julia)
+                    # LOC80-END PY_OPT_SCALAR
 
         if enable_syndrome and (is_layered or ite != n_ite):
             if not is_layered:
@@ -496,9 +514,11 @@ def decode_siho_opt_scalar_i16(
                 acc = _sadd_sat_i16(acc, c2v[e])
             post[v] = acc
 
+    # LOC80-BEGIN PY_OPT_SCALAR
     for i in range(K):
         V_K[i] = np.int16(1) if post[info_bits_pos[i]] < np.int16(0) else np.int16(0)
     return 0 if valid else 1
+    # LOC80-END PY_OPT_SCALAR
 
 
 # ====================================================================================================
@@ -515,6 +535,7 @@ def decode_siho_opt_scalar_i16(
 #   directly into hardware SIMD SSA registers (`q0..q31` on NEON, `ymm` on AVX2, `zmm` on AVX-512) with
 #   zero lane shuffling and zero stack traffic.
 
+# LOC80-BEGIN PY_OPT_INTER
 def _make_f32_simd_kernel(W: int):
     vf32_ty = ir.VectorType(ir.FloatType(), W)
     vi32_ty = ir.VectorType(ir.IntType(32), W)
@@ -675,6 +696,7 @@ def _make_f32_simd_kernel(W: int):
             builder.store(res, dst)
             return context.get_dummy_value()
         return types.none(types.int64, types.int64, types.int64, types.int64, types.int64, types.int64), codegen
+        # LOC80-END PY_OPT_INTER
 
     def _emit_tanh_cephes(builder, x):
         f_abs = _decl_intrinsic(builder, f"llvm.fabs.v{W}f32", vf32_ty, [vf32_ty])
@@ -938,6 +960,7 @@ def _make_f32_simd_kernel(W: int):
                 vadd_f32(pu, vv, nmsg)
                 vstore_f32(post, u, pu)
 
+    # LOC80-BEGIN PY_OPT_INTER
     @njit(nogil=True, fastmath=True)
     def _vstep_layered_oms_f32(chk_offsets, chk_to_var, offset, post, c2v, contrib):
         n_chk = chk_offsets.shape[0] - 1
@@ -975,6 +998,7 @@ def _make_f32_simd_kernel(W: int):
                 vstore_f32(c2v, k, nmsg)
                 vadd_f32(pu, vv, nmsg)
                 vstore_f32(post, u, pu)
+                # LOC80-END PY_OPT_INTER
 
     @njit(nogil=True, fastmath=True)
     def _vcheck_syndrome_f32(chk_offsets, chk_to_var, post) -> bool:
@@ -990,6 +1014,7 @@ def _make_f32_simd_kernel(W: int):
                 return False
         return True
 
+    # LOC80-BEGIN PY_OPT_INTER
     @njit(nogil=True, fastmath=True)
     def kernel_f32(
         var_offsets: np.ndarray,
@@ -1028,6 +1053,7 @@ def _make_f32_simd_kernel(W: int):
         valid = True
         ite_done = 0
         for ite in range(1, n_ite + 1):
+        # LOC80-END PY_OPT_INTER
             if not is_layered:
                 _vupdate_var_f32(var_offsets, Y_N_buf, c2v, v2c, post, True)
                 if not is_oms:
@@ -1038,7 +1064,9 @@ def _make_f32_simd_kernel(W: int):
                 if not is_oms:
                     _vstep_layered_spa_f32(chk_offsets, chk_to_var, post, c2v, vals, contrib)
                 else:
+                    # LOC80-BEGIN PY_OPT_INTER
                     _vstep_layered_oms_f32(chk_offsets, chk_to_var, offset, post, c2v, contrib)
+                    # LOC80-END PY_OPT_INTER
 
             if enable_syndrome and (is_layered or ite != n_ite):
                 if not is_layered:
@@ -1055,14 +1083,17 @@ def _make_f32_simd_kernel(W: int):
         if not is_layered and ite_done == n_ite:
             _vupdate_var_f32(var_offsets, Y_N_buf, c2v, v2c, post, False)
 
+        # LOC80-BEGIN PY_OPT_INTER
         for w in range(W):
             for i in range(K):
                 V_K_wave[w, i] = np.int32(1) if post[info_bits_pos[i], w] < np.float32(0.0) else np.int32(0)
         return 0 if valid else 1
 
     return kernel_f32
+    # LOC80-END PY_OPT_INTER
 
 
+# LOC80-BEGIN PY_OPT_INTER
 def _make_i16_simd_kernel(W: int):
     vi16_ty = ir.VectorType(ir.IntType(16), W)
     pi16_ty = ir.PointerType(vi16_ty)
@@ -1136,6 +1167,7 @@ def _make_i16_simd_kernel(W: int):
             builder.store(builder.call(fn, [va, vb]), dst)
             return context.get_dummy_value()
         return types.none(types.int64, types.int64, types.int64), codegen
+        # LOC80-END PY_OPT_INTER
 
     @intrinsic
     def vsadd_sat_val_i16(typingctx, dst_ty, a_ty, b_ty, sat_ty, neg_sat_ty):
@@ -1155,6 +1187,7 @@ def _make_i16_simd_kernel(W: int):
             return context.get_dummy_value()
         return types.none(types.int64, types.int64, types.int64, types.int64, types.int64), codegen
 
+    # LOC80-BEGIN PY_OPT_INTER
     @intrinsic
     def voms_in_i16(typingctx, v_ty, sng_ty, m1_ty, m2_ty):
         def codegen(context, builder, sig, args):
@@ -1221,6 +1254,7 @@ def _make_i16_simd_kernel(W: int):
             builder.store(res, dst)
             return context.get_dummy_value()
         return types.none(types.int64, types.int64, types.int64, types.int64, types.int64, types.int64, types.int64, types.int64), codegen
+        # LOC80-END PY_OPT_INTER
 
     @intrinsic
     def vsynd_xor_i16(typingctx, synd_ty, pv_ty):
@@ -1294,6 +1328,7 @@ def _make_i16_simd_kernel(W: int):
                 voms_out_i16(nmsg, vv, sng, m1, c1, c2, sat_v, neg_sat_v)
                 vstore_i16(c2v, tk, nmsg)
 
+    # LOC80-BEGIN PY_OPT_INTER
     @njit(nogil=True, fastmath=True)
     def _vstep_layered_oms_i16(chk_offsets, chk_to_var, offset, sat_val, post, c2v, contrib):
         n_chk = chk_offsets.shape[0] - 1
@@ -1333,8 +1368,9 @@ def _make_i16_simd_kernel(W: int):
                 vload_i16(vv, contrib, idx)
                 voms_out_i16(nmsg, vv, sng, m1, c1, c2, sat_v, neg_sat_v)
                 vstore_i16(c2v, k, nmsg)
-                vsadd_sat_val_i16(pu, vv, nmsg, sat_v, neg_sat_v)
+                vsadd_i16(pu, vv, nmsg)  # posterior: int16 saturation only (as AFF3CT/Julia)
                 vstore_i16(post, u, pu)
+                # LOC80-END PY_OPT_INTER
 
     @njit(nogil=True, fastmath=True)
     def _vcheck_syndrome_i16(chk_offsets, chk_to_var, post) -> bool:
@@ -1350,6 +1386,7 @@ def _make_i16_simd_kernel(W: int):
                 return False
         return True
 
+    # LOC80-BEGIN PY_OPT_INTER
     @njit(nogil=True, fastmath=True)
     def kernel_i16(
         var_offsets: np.ndarray,
@@ -1387,11 +1424,14 @@ def _make_i16_simd_kernel(W: int):
         valid = True
         ite_done = 0
         for ite in range(1, n_ite + 1):
+        # LOC80-END PY_OPT_INTER
             if not is_layered:
                 _vupdate_var_i16(var_offsets, Y_N_buf, c2v, v2c, post, True)
                 _vstep_flooding_oms_i16(chk_offsets, transpose, offset, sat_val, v2c, c2v)
             else:
+                # LOC80-BEGIN PY_OPT_INTER
                 _vstep_layered_oms_i16(chk_offsets, chk_to_var, offset, sat_val, post, c2v, contrib)
+                # LOC80-END PY_OPT_INTER
 
             if enable_syndrome and (is_layered or ite != n_ite):
                 if not is_layered:
@@ -1408,14 +1448,17 @@ def _make_i16_simd_kernel(W: int):
         if not is_layered and ite_done == n_ite:
             _vupdate_var_i16(var_offsets, Y_N_buf, c2v, v2c, post, False)
 
+        # LOC80-BEGIN PY_OPT_INTER
         for w in range(W):
             for i in range(K):
                 V_K_wave[w, i] = np.int16(1) if post[info_bits_pos[i], w] < np.int16(0) else np.int16(0)
         return 0 if valid else 1
 
     return kernel_i16
+    # LOC80-END PY_OPT_INTER
 
 
+# LOC80-BEGIN PY_OPT_INTER.module
 decode_siho_opt_inter_f32_w4 = _make_f32_simd_kernel(4)
 decode_siho_opt_inter_f32_w8 = _make_f32_simd_kernel(8)
 decode_siho_opt_inter_f32_w16 = _make_f32_simd_kernel(16)
@@ -1423,6 +1466,7 @@ decode_siho_opt_inter_f32_w16 = _make_f32_simd_kernel(16)
 decode_siho_opt_inter_i16_w8 = _make_i16_simd_kernel(8)
 decode_siho_opt_inter_i16_w16 = _make_i16_simd_kernel(16)
 decode_siho_opt_inter_i16_w32 = _make_i16_simd_kernel(32)
+# LOC80-END PY_OPT_INTER.module
 
 
 def decode_siho_opt_inter_f32(

@@ -16,6 +16,7 @@
 #        - `ScalarMode`       (intra-frame, 1 frame per wave)
 #        - `SimdInterMode`    (inter-frame SIMD across `W = n_frames_per_wave` frames simultaneously)
 
+# LOC80-BEGIN JL_OPT.module
 abstract type AbstractSchedule end
 struct ScheduleFlooding <: AbstractSchedule end
 struct ScheduleLayered  <: AbstractSchedule end
@@ -30,7 +31,9 @@ abstract type AbstractExecMode end
 struct ScalarMode       <: AbstractExecMode end
 struct SimdInterMode{W} <: AbstractExecMode end
 SimdInterMode(W::Integer = 1) = SimdInterMode{Int(W)}()
+# LOC80-END JL_OPT.module
 
+# LOC80-BEGIN JL_OPT_SCALAR
 @inline _max_val(::Type{Float32}) = floatmax(Float32)
 @inline _max_val(::Type{Int16})   = typemax(Int16)
 
@@ -47,9 +50,11 @@ end
 
 @inline _sub_sat(a::Float32, b::Float32)::Float32 = a - b
 @inline _sub_sat(a::Int16, b::Int16)::Int16 = Int16(clamp(Int32(a) - Int32(b), Int32(typemin(Int16)), Int32(typemax(Int16))))
+# LOC80-END JL_OPT_SCALAR
 
 # Immutable read-only Tanner graph representation of the LDPC parity-check matrix H
 # and decoder configuration parameters. Shared across all worker threads (`shared = true`).
+# LOC80-BEGIN JL_OPT.module
 struct LDPC_Graph{S<:AbstractSchedule, U<:AbstractUpdateRule, T<:Union{Float32, Int16}}
     schedule::S
     rule::U
@@ -163,6 +168,7 @@ function LDPC_Graph(
         info_bits_pos
     )
 end
+# LOC80-END JL_OPT.module
 
 # Backward-compatible constructor defaulting to `(ScheduleFlooding, RuleSPA, Float32)`.
 function LDPC_Graph(
@@ -192,6 +198,7 @@ end
 
 # Per-thread mutable working buffers (`shared = false`) parameterized by execution mode `M`
 # (`ScalarMode` or `SimdInterMode`) and LLR representation `T` (`Float32` or `Int16`).
+# LOC80-BEGIN JL_OPT.module
 mutable struct LDPC_Workspace{M<:AbstractExecMode, T<:Union{Float32, Int16}}
     mode::M
     # Scalar mode 1D buffers
@@ -221,7 +228,9 @@ function LDPC_Workspace(
     nb = Int(n_branches)
     mc = Int(max_chk_degree)
     W  = max(1, Int(n_frames_per_wave))
+    # LOC80-END JL_OPT.module
 
+    # LOC80-BEGIN JL_OPT_INTER.module
     if mode_sym === :INTER || mode_sym === :SIMD_INTER
         return LDPC_Workspace{SimdInterMode{W}, T}(
             SimdInterMode(W),
@@ -237,6 +246,8 @@ function LDPC_Workspace(
             zeros(Float32, W, mc),
             zeros(T, W, mc)
         )
+        # LOC80-END JL_OPT_INTER.module
+    # LOC80-BEGIN JL_OPT_SCALAR.module
     else
         return LDPC_Workspace{ScalarMode, T}(
             ScalarMode(),
@@ -252,8 +263,11 @@ function LDPC_Workspace(
             Matrix{Float32}(undef, 0, 0),
             Matrix{T}(undef, 0, 0)
         )
+        # LOC80-END JL_OPT_SCALAR.module
+    # LOC80-BEGIN JL_OPT.module
     end
 end
+# LOC80-END JL_OPT.module
 
 # Backward-compatible constructor defaulting to `(ScalarMode, Float32)`.
 function LDPC_Workspace(n_var_nodes::Int32, n_branches::Int32, max_chk_degree::Int32)
@@ -261,6 +275,7 @@ function LDPC_Workspace(n_var_nodes::Int32, n_branches::Int32, max_chk_degree::I
 end
 
 # Ensures `SimdInterMode` buffers match the runtime `W = n_frames_per_wave` if `set_n_frames` was called after constructor.
+# LOC80-BEGIN JL_OPT_INTER.module
 @inline function _ensure_inter_capacity!(
     work::LDPC_Workspace{<:SimdInterMode, T},
     W::Int,
@@ -278,6 +293,7 @@ end
     end
     return nothing
 end
+# LOC80-END JL_OPT_INTER.module
 
 # ====================================================================================================
 # 1. SCALAR KERNELS (`ScalarMode`)
@@ -513,6 +529,7 @@ end
 end
 
 # Horizontal Layered + OMS (Scalar, `Float32` or `Int16`)
+# LOC80-BEGIN JL_OPT_SCALAR
 @inline function _decode_single_ite_layered!(
     rule::RuleOMS{T},
     sat_val::T,
@@ -566,6 +583,7 @@ end
     end
     return nothing
 end
+# LOC80-END JL_OPT_SCALAR
 
 @inline function _compute_post!(
     var_offsets::Vector{Int32},
@@ -621,6 +639,7 @@ end
 # ====================================================================================================
 
 # Hardware SIMD register width in bytes (auto-detected across ARM64 NEON = 16B, x86 AVX2 = 32B, AVX-512 = 64B)
+# LOC80-BEGIN JL_OPT_INTER
 const _SIMD_REG_BYTES = if Sys.ARCH in (:x86_64, :i686)
     try
         ll = lowercase(unsafe_string(ccall(:jl_get_cpu_name, Cstring, ())))
@@ -919,11 +938,13 @@ end
     end
     return nothing
 end
+# LOC80-END JL_OPT_INTER
 
 # ====================================================================================================
 # 2.b REGISTER-RESIDENT LLVM SIMD VECTOR PRIMITIVES & KERNELS (`SimdInterMode`)
 # ====================================================================================================
 
+# LOC80-BEGIN JL_OPT_INTER
 @inline _vbroadcast(::Val{W}, x::T) where {W, T} = ntuple(_ -> Base.VecElement(x), Val(W))
 
 @inline _vload(::Val{W}, ptr::Ptr{T}, col::Int) where {W, T} =
@@ -942,6 +963,7 @@ end
     ir = "%r = fsub fast <$W x float> %0, %1\nret <$W x float> %r"
     return :($(Expr(:meta, :inline)); Base.llvmcall($ir, NTuple{$W, Base.VecElement{Float32}}, Tuple{NTuple{$W, Base.VecElement{Float32}}, NTuple{$W, Base.VecElement{Float32}}}, a, b))
 end
+# LOC80-END JL_OPT_INTER
 
 @generated function _vfmul(a::NTuple{W, Base.VecElement{Float32}}, b::NTuple{W, Base.VecElement{Float32}}) where {W}
     ir = "%r = fmul fast <$W x float> %0, %1\nret <$W x float> %r"
@@ -953,6 +975,7 @@ end
     return :($(Expr(:meta, :inline)); Base.llvmcall($ir, NTuple{$W, Base.VecElement{Float32}}, Tuple{NTuple{$W, Base.VecElement{Float32}}, NTuple{$W, Base.VecElement{Float32}}}, a, b))
 end
 
+# LOC80-BEGIN JL_OPT_INTER
 @generated function _vfmin(a::NTuple{W, Base.VecElement{Float32}}, b::NTuple{W, Base.VecElement{Float32}}) where {W}
     ir = "%c = fcmp fast olt <$W x float> %0, %1\n%r = select fast <$W x i1> %c, <$W x float> %0, <$W x float> %1\nret <$W x float> %r"
     return :($(Expr(:meta, :inline)); Base.llvmcall($ir, NTuple{$W, Base.VecElement{Float32}}, Tuple{NTuple{$W, Base.VecElement{Float32}}, NTuple{$W, Base.VecElement{Float32}}}, a, b))
@@ -1008,6 +1031,7 @@ end
         Tuple{NTuple{$W, Base.VecElement{Float32}}, NTuple{$W, Base.VecElement{Float32}}, NTuple{$W, Base.VecElement{Float32}}, NTuple{$W, Base.VecElement{Float32}}, NTuple{$W, Base.VecElement{Int32}}},
         var_abs, min1, cst1, cst2, sng))
 end
+# LOC80-END JL_OPT_INTER
 
 # --- Branchless SIMD Cephes `exp`, `log`, `tanh`, `atanh` (matching AFF3CT MIPP `neon_mathfun` / `avx_mathfun`) ---
 @generated function _vexp_floor(fx1::NTuple{W, Base.VecElement{Float32}}, one_v::NTuple{W, Base.VecElement{Float32}}) where {W}
@@ -1205,6 +1229,7 @@ end
 end
 
 # --- Int16 SIMD vector operations (with hardware saturating arithmetic `@llvm.sadd.sat` / `@llvm.ssub.sat`) ---
+# LOC80-BEGIN JL_OPT_INTER
 @generated function _vi16_add_sat(a::NTuple{W, Base.VecElement{Int16}}, b::NTuple{W, Base.VecElement{Int16}}) where {W}
     mod = """
     declare <$W x i16> @llvm.sadd.sat.v$(W)i16(<$W x i16>, <$W x i16>)
@@ -1284,6 +1309,7 @@ end
         Tuple{NTuple{$W, Base.VecElement{Int16}}, NTuple{$W, Base.VecElement{Int16}}, NTuple{$W, Base.VecElement{Int16}}, NTuple{$W, Base.VecElement{Int16}}, NTuple{$W, Base.VecElement{Int16}}, NTuple{$W, Base.VecElement{Int16}}, NTuple{$W, Base.VecElement{Int16}}},
         var_abs, min1, cst1, cst2, sng, sat_v, nsat_v))
 end
+# LOC80-END JL_OPT_INTER
 
 @generated function _vany_nonzero(v::NTuple{W, Base.VecElement{T}}) where {W, T<:Union{Int32, Int16}}
     ebits = sizeof(T) * 8
@@ -1552,6 +1578,7 @@ end
 end
 
 # --- Horizontal Layered + OMS (`SimdInterMode`, `Float32`) ---
+# LOC80-BEGIN JL_OPT_INTER
 @inline function _decode_single_ite_layered_inter!(
     rule::RuleOMS{Float32},
     ::Float32,
@@ -1663,6 +1690,7 @@ end
     end
     return nothing
 end
+# LOC80-END JL_OPT_INTER
 
 # --- Horizontal Layered + SPA (`SimdInterMode`, `Float32`) ---
 @inline function _decode_single_ite_layered_inter!(
@@ -1834,6 +1862,7 @@ function decode_siho_julia(
 end
 
 # 3.b Scalar + Horizontal Layered (`ScheduleLayered`, `ScalarMode`)
+# LOC80-BEGIN JL_OPT_SCALAR
 function decode_siho_julia(
     graph::LDPC_Graph{ScheduleLayered, U, T},
     work::LDPC_Workspace{ScalarMode, T},
@@ -1868,6 +1897,7 @@ function decode_siho_julia(
             work.post,
             work.msg_chk_to_var
         )
+        # LOC80-END JL_OPT_SCALAR
 
         if graph.enable_syndrome
             syndrome = _check_syndrome_soft(graph.chk_offsets, graph.chk_to_var, work.post)
@@ -1877,6 +1907,7 @@ function decode_siho_julia(
                 break
             end
         end
+    # LOC80-BEGIN JL_OPT_SCALAR
     end
 
     @inbounds for v in 1:K
@@ -1886,6 +1917,7 @@ function decode_siho_julia(
 
     return ifelse(valid_synd, Int32(0), Int32(1))
 end
+# LOC80-END JL_OPT_SCALAR
 
 # 3.c Inter-Frame SIMD + Flooding (`ScheduleFlooding`, `SimdInterMode`)
 @inline function _run_flooding_inter!(
@@ -1977,6 +2009,7 @@ function decode_siho_julia(
 end
 
 # 3.d Inter-Frame SIMD + Horizontal Layered (`ScheduleLayered`, `SimdInterMode`)
+# LOC80-BEGIN JL_OPT_INTER
 @inline function _run_layered_inter!(
     graph::LDPC_Graph{ScheduleLayered, U, T},
     work::LDPC_Workspace{<:SimdInterMode, T},
@@ -2007,6 +2040,7 @@ end
             work,
             val_W
         )
+        # LOC80-END JL_OPT_INTER
 
         if graph.enable_syndrome
             syndrome = _check_syndrome_soft_inter(graph.chk_offsets, graph.chk_to_var, work.post_inter, val_W)
@@ -2016,12 +2050,15 @@ end
                 break
             end
         end
+    # LOC80-BEGIN JL_OPT_INTER
     end
 
     _extract_hard_decision_inter!(sck_V_K, work.post_inter, graph.info_bits_pos, K, val_W)
     return ifelse(valid_synd, Int32(0), Int32(1))
 end
+# LOC80-END JL_OPT_INTER
 
+# LOC80-BEGIN JL_OPT_INTER.module
 function decode_siho_julia(
     graph::LDPC_Graph{ScheduleLayered, U, T},
     work::LDPC_Workspace{SimdInterMode{W}, T},
@@ -2033,6 +2070,7 @@ function decode_siho_julia(
     Int(n_frames_per_wave) == W && return _run_layered_inter!(graph, work, sck_Y_N, sck_V_K, Val(W))
     return _run_layered_inter!(graph, work, sck_Y_N, sck_V_K, Val(Int(n_frames_per_wave)))
 end
+# LOC80-END JL_OPT_INTER.module
 
 # Ahead-of-execution compilation for ScalarMode and SimdInterMode kernels
 const _SIMD_W_F32 = _SIMD_REG_BYTES ÷ sizeof(Float32)

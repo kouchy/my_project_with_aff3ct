@@ -37,20 +37,30 @@ You can go in this folder to see the next steps.
 > [!note]
 > If you want to compile Julia examples (or the polyglot Python + Julia + C++
 > examples in [`examples/python_polyglot/`](examples/python_polyglot/README.md)),
-> first align `lib/aff3ct/lib/streampu` onto the newer `StreamPU` version shipped
-> in `lib/pystreampu/lib/streampu`:
+> AFF3CT must be built with the `StreamPU` version shipped in
+> `lib/pystreampu/lib/streampu`, which is newer than the one recorded in the
+> AFF3CT submodule. The AFF3CT submodule itself is **not** updated: only its
+> `lib/streampu` working copy is moved to the pyStreamPU commit:
 > ```bash
-> git -C lib/aff3ct/lib/streampu fetch ../../pystreampu/lib/streampu
-> git -C lib/aff3ct/lib/streampu checkout $(git -C lib/pystreampu/lib/streampu rev-parse HEAD)
+> git submodule update --init --recursive
+> ./scripts/use_pystreampu_streampu.sh          # align lib/aff3ct/lib/streampu on lib/pystreampu/lib/streampu
+> ./scripts/use_pystreampu_streampu.sh --check  # verify (also useful before every rebuild)
 > ```
-> Then explicitly link StreamPU with `libjulia` (`-DSPU_LINK_JULIA="ON"`)
-> and install the StreamPU library alongside AFF3CT so that both `AFF3CT`
-> and `pyStreamPU` share the exact same `StreamPU` instance:
+> `git status` then shows `lib/aff3ct` as modified (new commit in its nested
+> `lib/streampu`): this is expected, do **not** commit `lib/aff3ct` for that.
+> Any later `git submodule update --recursive` restores the old StreamPU commit:
+> run the script again and rebuild AFF3CT, pyStreamPU and `py_aff3ct`.
+>
+> Then explicitly link StreamPU with `libjulia` (`-DSPU_LINK_JULIA="ON"`) and
+> `hwloc` (`-DSPU_LINK_HWLOC="ON"`, required by the thread pinning options:
+> without it, pinning is silently a no-op), and install the StreamPU library
+> alongside AFF3CT so that both `AFF3CT` and `pyStreamPU` share the exact same
+> `StreamPU` instance:
 > ```bash
 > cmake .. -G"Unix Makefiles" -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_CXX_FLAGS="-Wall -funroll-loops -march=native" \
 >           -DCMAKE_POSITION_INDEPENDENT_CODE="ON" \
 >           -DAFF3CT_COMPILE_EXE="OFF" -DAFF3CT_COMPILE_STATIC_LIB="ON" -DAFF3CT_COMPILE_SHARED_LIB="ON" \
->           -DSPU_COMPILE_STATIC_LIB="ON" -DSPU_COMPILE_SHARED_LIB="ON" -DSPU_LINK_JULIA="ON"
+>           -DSPU_COMPILE_STATIC_LIB="ON" -DSPU_COMPILE_SHARED_LIB="ON" -DSPU_LINK_JULIA="ON" -DSPU_LINK_HWLOC="ON"
 > ```
 > See [`examples/python_polyglot/README.md`](examples/python_polyglot/README.md) for the complete instructions to build `lib/pystreampu` (`INCLUDE_SPU_LIB=OFF`) and run the Python polyglot benchmarks.
 

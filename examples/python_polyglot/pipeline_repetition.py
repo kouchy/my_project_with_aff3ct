@@ -110,10 +110,23 @@ def parse_args():
     p.add_argument("--sim-sequence", action="store_true", help="Run a replicated Sequence instead of 3-stage Pipeline")
     p.add_argument("--sim-interstage-buf", type=int, default=0, help="Pipeline inter-stage buffer size")
     p.add_argument("--sim-active-waiting", action="store_true", help="Enable active waiting on inter-stage buffers")
+    p.add_argument("--mixed", action="store_true",
+                   help="Mixed-language stage 1: Python/Numba BPSK demodulator followed by the decoder (instead of the C++ demodulator in stage 0)")
+    p.add_argument("--stage-split", type=str, default="source", choices=["source", "frontend", "rx"],
+                   help="Pipeline split: source = [source | enc..dec | monitor]; frontend = [source..channel | "
+                        "demod..dec | monitor]; rx = receiver-only chain [antenna replay | demod..dec | monitor]: "
+                        "the noisy frames are generated once by the transmitter and replayed from a ring buffer")
+    p.add_argument("--rx-buffer-mib", type=float, default=64.0,
+                   help="Size of the replayed channel-sample ring buffer for --stage-split rx (MiB, > last-level cache)")
     p.add_argument("--sim-pin-threads", action="store_true", help="Pin pipeline/sequence threads to physical CPU cores via hwloc")
+    p.add_argument("--sim-pin-offset", type=int, default=int(os.environ.get("SPU_PIN_OFFSET", "0")),
+                   help="First hwloc PU used for pinning (e.g. 8 on Zen 4 / 4 on Orin AGX with isolcpus; env SPU_PIN_OFFSET)")
     p.add_argument("--sim-warmup", type=int, default=0, help="Number of warmup frames before timed execution")
     p.add_argument("--sim-rt-stats", action="store_true", help="Run a 2nd pass with hardware cycle-counter RT latency/jitter stats")
     p.add_argument("--sim-rt-skip", type=int, default=64, help="Number of initial waves to skip in RT stats pass")
+    p.add_argument("--sim-rt-load", type=str, default="1",
+                   help="Comma-separated source loads for the RT pass, as fractions of the throughput measured in the "
+                        "1st pass (e.g. 1,0.9,0.5); 1 = saturated (unpaced), <1 = stage 0 paced like a sampled source")
     p.add_argument("--sim-stats", action="store_true", help="Enable per-task statistics")
     p.add_argument("-v", "--sim-verbose", action="store_true", help="Print # Exec_stats line per SNR")
     p.add_argument("--sim-dot", type=str, default="", help="Export Graphviz .dot file")
@@ -141,6 +154,11 @@ def main():
     channel = py_aff3ct.Channel_AWGN_LLR(N_cw, "FAST")
     monitor = py_aff3ct.Monitor_BFER(K, args.max_fe, args.mnt_max_fra)
     sink = spu.sink_no(K, dtype=spu.int32)
+    rx = args.stage_split == "rx"
+    if rx:
+        # receiver-only chain: the transmitter (source, encoder, modulator, channel) only fills the antenna buffer
+        antenna = py_aff3ct.Antenna_replay(K, N_cw, int(args.rx_buffer_mib * (1 << 20)))
+        modem_tx = py_aff3ct.Modem_BPSK_fast(N_cw)
 
     if jl_dec:
         spu.julia.init()
@@ -166,22 +184,54 @@ def main():
     else:
         raise ValueError(f"Unsupported decoder implementation: {args.dec_implem}")
 
-    for mdl in (source, encoder, modem, channel, decoder, monitor, sink):
+    demod = None
+    if args.mixed:
+        from tasks.demod_numba import DemodBPSKNumba
+
+        demod = DemodBPSKNumba(N_cw)
+        dec_desc = "Python/Numba demodulator + " + dec_desc
+
+    for mdl in (source, encoder, modem, channel, decoder, monitor, sink) + ((demod,) if demod is not None else ()):
         mdl.n_frames = n_frames
+    if rx:
+        for mdl in (antenna, modem_tx):
+            mdl.n_frames = n_frames
 
     # Bind task sockets in Python (Control Plane)
     sigma_buf = py_aff3ct.Sigma_buffer(n_frames, 1.0)
-    encoder["encode::U_K"].bind(source["generate::out_data"])
-    modem["modulate::X_N1"].bind(encoder["encode::X_N"])
-    channel["add_noise::X_N"].bind(modem["modulate::X_N2"])
-    sigma_buf.bind(channel["add_noise::CP"])
-    modem["demodulate::Y_N1"].bind(channel["add_noise::Y_N"])
-    sigma_buf.bind(modem["demodulate::CP"])
-    decoder["decode_siho::Y_N"].bind(modem["demodulate::Y_N2"])
-    monitor["check_errors::U"].bind(source["generate::out_data"])
-    monitor["check_errors::V"].bind(decoder["decode_siho::V_K"])
-    sink["send_count::in_count"].bind(source["generate::out_count"])
-    sink["send_count::in_data"].bind(decoder["decode_siho::V_K"])
+    if rx:
+        # transmitter -> antenna.record (fill phase, outside the pipeline)
+        encoder["encode::U_K"].bind(source["generate::out_data"])
+        modem_tx["modulate::X_N1"].bind(encoder["encode::X_N"])
+        channel["add_noise::X_N"].bind(modem_tx["modulate::X_N2"])
+        sigma_buf.bind(channel["add_noise::CP"])
+        antenna["record::U_K"].bind(source["generate::out_data"])
+        antenna["record::Y_N"].bind(channel["add_noise::Y_N"])
+        tx_tasks = [source["generate"], encoder["encode"], modem_tx["modulate"], channel["add_noise"]]
+        # receiver: antenna.receive -> demod -> decoder -> monitor
+        dem = modem if demod is None else demod
+        dem["demodulate::Y_N1"].bind(antenna["receive::Y_N"])
+        sigma_buf.bind(dem["demodulate::CP"])
+        decoder["decode_siho::Y_N"].bind(dem["demodulate::Y_N2"])
+        monitor["check_errors::U"].bind(antenna["receive::U_K"])
+        monitor["check_errors::V"].bind(decoder["decode_siho::V_K"])
+    else:
+        encoder["encode::U_K"].bind(source["generate::out_data"])
+        modem["modulate::X_N1"].bind(encoder["encode::X_N"])
+        channel["add_noise::X_N"].bind(modem["modulate::X_N2"])
+        sigma_buf.bind(channel["add_noise::CP"])
+        if demod is None:
+            modem["demodulate::Y_N1"].bind(channel["add_noise::Y_N"])
+            sigma_buf.bind(modem["demodulate::CP"])
+            decoder["decode_siho::Y_N"].bind(modem["demodulate::Y_N2"])
+        else:
+            demod["demodulate::Y_N1"].bind(channel["add_noise::Y_N"])
+            sigma_buf.bind(demod["demodulate::CP"])
+            decoder["decode_siho::Y_N"].bind(demod["demodulate::Y_N2"])
+        monitor["check_errors::U"].bind(source["generate::out_data"])
+        monitor["check_errors::V"].bind(decoder["decode_siho::V_K"])
+        sink["send_count::in_count"].bind(source["generate::out_count"])
+        sink["send_count::in_data"].bind(decoder["decode_siho::V_K"])
 
     eff_buf = args.sim_interstage_buf if args.sim_interstage_buf > 0 else max(4, 2 * n_threads)
 
@@ -189,11 +239,14 @@ def main():
     print("# Polyglot Repetition Chain (Assembled in Python via pyStreamPU)")
     print(f"# Runtime        : {'Sequence (replicated)' if args.sim_sequence else 'Pipeline (3 stages)'}")
     print(f"# Threads (t)    : {n_threads}")
+    print(f"# Stage split    : {args.stage_split}")
     print(f"# Inter-frame (F): {n_frames}")
     print(f"# Code (N, K)    : ({N_cw}, {K}), R = {R:.4f}")
     print(f"# Decoder backend: {dec_desc}")
     print("#----------------------------------------------------------")
 
+    if rx and args.sim_sequence:
+        raise ValueError("--stage-split rx is a pipeline chain (not supported with --sim-sequence)")
     if args.sim_pin_threads:
         py_aff3ct.thread_pinning_init()
 
@@ -202,7 +255,7 @@ def main():
             source["generate"],
             n_threads,
             thread_pinning=args.sim_pin_threads,
-            sequence_pinning_policy="; ".join(f"PU_{i}" for i in range(n_threads)) if args.sim_pin_threads else "",
+            sequence_pinning_policy="; ".join(f"PU_{args.sim_pin_offset + i}" for i in range(n_threads)) if args.sim_pin_threads else "",
         )
         cloned_monitors = runtime.get_cloned_modules(monitor)
         monitor_red = py_aff3ct.Monitor_BFER_reduction(cloned_monitors)
@@ -211,15 +264,26 @@ def main():
             runtime.export_dot(args.sim_dot)
     else:
         pin_flags = [True, True, True] if args.sim_pin_threads else [False, False, False]
-        pin_puids = [[0], list(range(1, 1 + n_threads)), [1 + n_threads]] if args.sim_pin_threads else []
-        runtime = spu.Pipeline(
-            [source["generate"]],
-            [monitor["check_errors"], sink["send_count"]],
-            [
-                [[source["generate"]], [source["generate"]], []],
-                [[encoder["encode"]], [decoder["decode_siho"]], []],
+        o = args.sim_pin_offset
+        pin_puids = [[o], list(range(o + 1, o + 1 + n_threads)), [o + 1 + n_threads]] if args.sim_pin_threads else []
+        if rx:
+            p_first, p_last = [antenna["receive"]], [monitor["check_errors"]]
+            p_stages = [
+                [[antenna["receive"]], [antenna["receive"]], []],
+                [[dem["demodulate"]], [decoder["decode_siho"]], []],
+                [[monitor["check_errors"]], [], []],
+            ]
+        else:
+            p_first, p_last = [source["generate"]], [monitor["check_errors"], sink["send_count"]]
+            p_stages = [
+                [[source["generate"]], [source["generate"]] if args.stage_split == "source" else [channel["add_noise"]], []],
+                [[encoder["encode"]] if args.stage_split == "source" else [(modem["demodulate"] if demod is None else demod["demodulate"])], [decoder["decode_siho"]], []],
                 [[monitor["check_errors"], sink["send_count"]], [], []],
-            ],
+            ]
+        runtime = spu.Pipeline(
+            p_first,
+            p_last,
+            p_stages,
             [1, n_threads, 1],
             [eff_buf, eff_buf],
             [args.sim_active_waiting, args.sim_active_waiting],
@@ -235,12 +299,25 @@ def main():
     else:
         py_aff3ct.configure_pipeline_tasks(runtime, args.sim_stats)
 
+    def exec_pipe(max_fra):
+        if rx:
+            return py_aff3ct.exec_pipeline_rx(runtime, monitor, max_fra, n_frames)
+        return py_aff3ct.exec_pipeline(runtime, monitor, source, max_fra, n_frames)
+
+    def set_sigma(sig):
+        sigma_buf.set_sigma(sig)
+        if rx:  # regenerate the replayed frames at this noise level
+            antenna.fill(tx_tasks)
+
+    if rx:
+        print(f"# Antenna buffer : {antenna.get_n_buf()} frames ({antenna.get_buffer_bytes() / 2**20:.1f} MiB of channel samples)")
+
     if args.sim_warmup > 0 and not args.sim_sequence:
         py_aff3ct.seed_pipeline_modules(runtime)
         esn0_w = py_aff3ct.ebn0_to_esn0(args.ebn0_min, R, 1)
-        sigma_buf.set_sigma(py_aff3ct.esn0_to_sigma(esn0_w, 1))
+        set_sigma(py_aff3ct.esn0_to_sigma(esn0_w, 1))
         runtime.set_rt_stats(False)
-        py_aff3ct.exec_pipeline(runtime, monitor, source, args.sim_warmup, n_frames)
+        exec_pipe(args.sim_warmup)
         py_aff3ct.reset_pipeline_modules(runtime)
 
     print("#  Eb/N0 |   Es/N0 |        FRA |         BE |         FE |        BER |        FER |  SIM_CTHR")
@@ -256,7 +333,7 @@ def main():
 
         esn0 = py_aff3ct.ebn0_to_esn0(ebn0, R, 1)
         sigma = py_aff3ct.esn0_to_sigma(esn0, 1)
-        sigma_buf.set_sigma(sigma)
+        set_sigma(sigma)
 
         if args.sim_sequence:
             elapsed_us = py_aff3ct.exec_sequence(runtime, monitor_red)
@@ -266,7 +343,7 @@ def main():
             ber = monitor_red.get_ber()
             fer = monitor_red.get_fer()
         else:
-            elapsed_us = py_aff3ct.exec_pipeline(runtime, monitor, source, args.mnt_max_fra, n_frames)
+            elapsed_us = exec_pipe(args.mnt_max_fra)
             n_fra = monitor.get_n_analyzed_fra()
             n_be = monitor.get_n_be()
             n_fe = monitor.get_n_fe()
@@ -288,33 +365,39 @@ def main():
             )
 
         if args.sim_rt_stats and not args.sim_sequence:
-            py_aff3ct.reset_pipeline_modules(runtime)
-            py_aff3ct.seed_pipeline_modules(runtime)
-            runtime.reset_rt_stats()
-            eff_rt_skip = min(args.sim_rt_skip, max(2, (n_fra // max(1, n_frames * n_threads)) // 4))
-            runtime.set_rt_stats(True, eff_rt_skip)
-            py_aff3ct.exec_pipeline(runtime, monitor, source, args.mnt_max_fra, n_frames)
-            rt = runtime.get_rt_stats()
-            runtime.set_rt_stats(False)
-            stgs = rt["stages"]
-            s0 = stgs[0] if len(stgs) > 0 else {}
-            s1 = stgs[1] if len(stgs) > 1 else {}
-            s2 = stgs[2] if len(stgs) > 2 else {}
-            print(
-                f"# Rt_stats: ebn0={ebn0:.2f} e2e_calls={rt.get('e2e_n_calls', 0)} "
-                f"e2e_avg_ns={rt.get('e2e_avg_ns', 0.0):.2f} e2e_std_ns={rt.get('e2e_std_ns', 0.0):.2f} "
-                f"e2e_p10_ns={rt.get('e2e_p10_ns', 0.0):.2f} e2e_p25_ns={rt.get('e2e_p25_ns', 0.0):.2f} "
-                f"e2e_p50_ns={rt.get('e2e_p50_ns', 0.0):.2f} e2e_p75_ns={rt.get('e2e_p75_ns', 0.0):.2f} "
-                f"e2e_p90_ns={rt.get('e2e_p90_ns', 0.0):.2f} e2e_p99_ns={rt.get('e2e_p99_ns', 0.0):.2f} "
-                f"e2e_p999_ns={rt.get('e2e_p999_ns', 0.0):.2f} e2e_max_ns={rt.get('e2e_max_ns', 0.0):.2f} "
-                f"stg0_avg_ns={s0.get('avg_ns', 0.0):.2f} stg0_p50_ns={s0.get('p50_ns', 0.0):.2f} stg0_p99_ns={s0.get('p99_ns', 0.0):.2f} "
-                f"stg1_calls={s1.get('n_calls', 0)} stg1_avg_ns={s1.get('avg_ns', 0.0):.2f} stg1_std_ns={s1.get('std_ns', 0.0):.2f} "
-                f"stg1_p10_ns={s1.get('p10_ns', 0.0):.2f} stg1_p25_ns={s1.get('p25_ns', 0.0):.2f} "
-                f"stg1_p50_ns={s1.get('p50_ns', 0.0):.2f} stg1_p75_ns={s1.get('p75_ns', 0.0):.2f} "
-                f"stg1_p90_ns={s1.get('p90_ns', 0.0):.2f} stg1_p99_ns={s1.get('p99_ns', 0.0):.2f} "
-                f"stg1_p999_ns={s1.get('p999_ns', 0.0):.2f} stg1_max_ns={s1.get('max_ns', 0.0):.2f} "
-                f"stg2_avg_ns={s2.get('avg_ns', 0.0):.2f} stg2_p50_ns={s2.get('p50_ns', 0.0):.2f} stg2_p99_ns={s2.get('p99_ns', 0.0):.2f}"
-            )
+            # stage-0 period at load L = (frames per wave) / (L x frame rate measured in the 1st pass)
+            wave_ns = (float(n_frames) * elapsed_us * 1e3 / float(n_fra)) if n_fra > 0 else 0.0
+            for load in [float(x) for x in args.sim_rt_load.split(",") if x.strip()]:
+                pace_ns = wave_ns / load if (0.0 < load < 1.0) else 0.0
+                py_aff3ct.reset_pipeline_modules(runtime)
+                py_aff3ct.seed_pipeline_modules(runtime)
+                runtime.reset_rt_stats()
+                eff_rt_skip = min(args.sim_rt_skip, max(2, (n_fra // max(1, n_frames * n_threads)) // 4))
+                runtime.set_rt_stats(True, eff_rt_skip)
+                runtime.set_rt_pacing(pace_ns)
+                exec_pipe(args.mnt_max_fra)
+                rt = runtime.get_rt_stats()
+                runtime.set_rt_stats(False)
+                runtime.set_rt_pacing(0.0)
+                stgs = rt["stages"]
+                s0 = stgs[0] if len(stgs) > 0 else {}
+                s1 = stgs[1] if len(stgs) > 1 else {}
+                s2 = stgs[2] if len(stgs) > 2 else {}
+                print(
+                    f"# Rt_stats: ebn0={ebn0:.2f} load={load:.3f} pace_ns={pace_ns:.1f} e2e_calls={rt.get('e2e_n_calls', 0)} "
+                    f"e2e_avg_ns={rt.get('e2e_avg_ns', 0.0):.2f} e2e_std_ns={rt.get('e2e_std_ns', 0.0):.2f} "
+                    f"e2e_p10_ns={rt.get('e2e_p10_ns', 0.0):.2f} e2e_p25_ns={rt.get('e2e_p25_ns', 0.0):.2f} "
+                    f"e2e_p50_ns={rt.get('e2e_p50_ns', 0.0):.2f} e2e_p75_ns={rt.get('e2e_p75_ns', 0.0):.2f} "
+                    f"e2e_p90_ns={rt.get('e2e_p90_ns', 0.0):.2f} e2e_p99_ns={rt.get('e2e_p99_ns', 0.0):.2f} "
+                    f"e2e_p999_ns={rt.get('e2e_p999_ns', 0.0):.2f} e2e_max_ns={rt.get('e2e_max_ns', 0.0):.2f} "
+                    f"stg0_avg_ns={s0.get('avg_ns', 0.0):.2f} stg0_p50_ns={s0.get('p50_ns', 0.0):.2f} stg0_p99_ns={s0.get('p99_ns', 0.0):.2f} "
+                    f"stg1_calls={s1.get('n_calls', 0)} stg1_avg_ns={s1.get('avg_ns', 0.0):.2f} stg1_std_ns={s1.get('std_ns', 0.0):.2f} "
+                    f"stg1_p10_ns={s1.get('p10_ns', 0.0):.2f} stg1_p25_ns={s1.get('p25_ns', 0.0):.2f} "
+                    f"stg1_p50_ns={s1.get('p50_ns', 0.0):.2f} stg1_p75_ns={s1.get('p75_ns', 0.0):.2f} "
+                    f"stg1_p90_ns={s1.get('p90_ns', 0.0):.2f} stg1_p99_ns={s1.get('p99_ns', 0.0):.2f} "
+                    f"stg1_p999_ns={s1.get('p999_ns', 0.0):.2f} stg1_max_ns={s1.get('max_ns', 0.0):.2f} "
+                    f"stg2_avg_ns={s2.get('avg_ns', 0.0):.2f} stg2_p50_ns={s2.get('p50_ns', 0.0):.2f} stg2_p99_ns={s2.get('p99_ns', 0.0):.2f}"
+                )
 
         if args.sim_sequence:
             monitor_red.reset()

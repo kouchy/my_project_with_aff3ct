@@ -8,6 +8,7 @@
 #   - Single unified kernel family parameterized by `Val(W)` (`Val(1)` for `ScalarMode`, `Val(W)` for `SimdInterMode`)
 #     using immutable `ntuple` + dot-broadcasting (`.+`, `min.`, `ifelse.`) so LLVM keeps accumulators in registers.
 
+# LOC80-BEGIN JL_STD.module
 abstract type AbstractSchedule end
 struct ScheduleFlooding <: AbstractSchedule end
 struct ScheduleLayered  <: AbstractSchedule end
@@ -22,7 +23,9 @@ abstract type AbstractExecMode end
 struct ScalarMode       <: AbstractExecMode end
 struct SimdInterMode{W} <: AbstractExecMode end
 SimdInterMode(W::Integer = 1) = SimdInterMode{Int(W)}()
+# LOC80-END JL_STD.module
 
+# LOC80-BEGIN JL_STD
 @inline _max_val(::Type{Float32}) = floatmax(Float32)
 @inline _max_val(::Type{Int16})   = typemax(Int16)
 
@@ -36,7 +39,9 @@ SimdInterMode(W::Integer = 1) = SimdInterMode{Int(W)}()
 
 @inline _sub_sat(a::Float32, b::Float32)::Float32 = a - b
 @inline _sub_sat(a::Int16,   b::Int16)::Int16     = _saturate(Int32(a) - Int32(b), typemax(Int16))
+# LOC80-END JL_STD
 
+# LOC80-BEGIN JL_STD.module
 struct LDPC_Graph{S<:AbstractSchedule, U<:AbstractUpdateRule, T<:Union{Float32, Int16}}
     schedule::S
     rule::U
@@ -50,7 +55,9 @@ struct LDPC_Graph{S<:AbstractSchedule, U<:AbstractUpdateRule, T<:Union{Float32, 
     chk_to_var::Vector{Int32}
     info_bits_pos::Vector{Int32}
 end
+# LOC80-END JL_STD.module
 
+# LOC80-BEGIN JL_STD.module
 function LDPC_Graph(
     sched_sym::Symbol, rule_sym::Symbol, ::Type{T},
     offset_val::Real, sat_val_in::Real,
@@ -106,6 +113,7 @@ function LDPC_Graph(
         var_offsets, chk_offsets, transpose, chk_to_var, info_bits_pos
     )
 end
+# LOC80-END JL_STD.module
 
 function LDPC_Graph(
     n_ite::Int32, enable_syndrome::Bool, syndrome_depth::Int32,
@@ -117,6 +125,7 @@ function LDPC_Graph(
         h_cols_addr, h_cols_len, info_bits_addr, K)
 end
 
+# LOC80-BEGIN JL_STD.module
 mutable struct LDPC_Workspace{M<:AbstractExecMode, T<:Union{Float32, Int16}}
     mode::M
     msg_chk_to_var::Matrix{T}
@@ -142,6 +151,7 @@ function LDPC_Workspace(
         zeros(Float32, W, mc), zeros(T, W, mc)
     )
 end
+# LOC80-END JL_STD.module
 
 LDPC_Workspace(nv::Int32, nb::Int32, mc::Int32) = LDPC_Workspace(:SCALAR, Float32, nv, nb, mc)
 
@@ -149,6 +159,7 @@ LDPC_Workspace(nv::Int32, nb::Int32, mc::Int32) = LDPC_Workspace(:SCALAR, Float3
 # UNIFIED BP KERNELS (parameterized by `Val(W)`: `W = 1` for ScalarMode, `W = n_frames` for SimdInterMode)
 # ====================================================================================================
 
+# LOC80-BEGIN JL_STD
 @inline _load_vec(A::Matrix{T}, col::Integer, ::Val{W}) where {T, W} =
     ntuple(w -> @inbounds(A[w, col]), Val(W))
 
@@ -157,6 +168,7 @@ LDPC_Workspace(nv::Int32, nb::Int32, mc::Int32) = LDPC_Workspace(:SCALAR, Float3
         A[w, col] = v[w]
     end
 end
+# LOC80-END JL_STD
 
 @inline function _update_var_nodes!(
     var_offsets::Vector{Int32}, Y_N::Matrix{T},
@@ -294,6 +306,7 @@ end
 end
 
 # 4. Horizontal Layered + OMS
+# LOC80-BEGIN JL_STD
 @inline function _step_bp!(
     ::ScheduleLayered, rule::RuleOMS{T}, sat_val::T,
     graph::LDPC_Graph, work::LDPC_Workspace{M, T}, vw::Val{W}
@@ -326,11 +339,13 @@ end
         end
     end
 end
+# LOC80-END JL_STD
 
 # ====================================================================================================
 # TOP-LEVEL ENTRY POINTS (`decode_siho_julia`)
 # ====================================================================================================
 
+# LOC80-BEGIN JL_STD
 @inline function _run_bp!(
     graph::LDPC_Graph{S, U, T}, work::LDPC_Workspace{M, T},
     sck_Y_N::AbstractVector{T}, sck_V_K::AbstractVector{B}, vw::Val{W}
@@ -348,10 +363,13 @@ end
 
     cur_depth, valid, ite_done = 0, true, 0
     for ite in 1:n_ite
+    # LOC80-END JL_STD
         if S === ScheduleFlooding
             _update_var_nodes!(graph.var_offsets, work.Y_N, work.msg_chk_to_var, work.msg_var_to_chk, work.post, vw, true)
         end
+        # LOC80-BEGIN JL_STD
         _step_bp!(graph.schedule, graph.rule, graph.sat_val, graph, work, vw)
+        # LOC80-END JL_STD
         if graph.enable_syndrome && (S === ScheduleLayered || ite != n_ite)
             if S === ScheduleFlooding
                 _update_var_nodes!(graph.var_offsets, work.Y_N, work.msg_chk_to_var, work.msg_var_to_chk, work.post, vw, false)
@@ -369,6 +387,7 @@ end
     if S === ScheduleFlooding && ite_done == n_ite
         _update_var_nodes!(graph.var_offsets, work.Y_N, work.msg_chk_to_var, work.msg_var_to_chk, work.post, vw, false)
     end
+    # LOC80-BEGIN JL_STD
     @inbounds for w in 1:W
         off = (w - 1) * K
         for i in 1:K
@@ -377,7 +396,9 @@ end
     end
     return ifelse(valid, Int32(0), Int32(1))
 end
+# LOC80-END JL_STD
 
+# LOC80-BEGIN JL_STD.module
 function decode_siho_julia(
     graph::LDPC_Graph{S, U, T}, work::LDPC_Workspace{ScalarMode, T},
     sck_Y_N::AbstractVector{T}, sck_V_K::AbstractVector{B},
@@ -385,6 +406,7 @@ function decode_siho_julia(
 )::Int32 where {S<:AbstractSchedule, U<:AbstractUpdateRule, T<:Union{Float32, Int16}, B<:Union{Int32, Int16}}
     return _run_bp!(graph, work, sck_Y_N, sck_V_K, Val(1))
 end
+# LOC80-END JL_STD.module
 
 function decode_siho_julia(
     graph::LDPC_Graph{S, U, T}, work::LDPC_Workspace{SimdInterMode{W}, T},

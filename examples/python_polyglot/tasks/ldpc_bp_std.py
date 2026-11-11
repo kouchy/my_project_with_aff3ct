@@ -15,6 +15,7 @@ import numpy as np
 from numba import njit, types
 
 
+# LOC80-BEGIN PY_STD
 @njit(nogil=True, fastmath=True, inline="always")
 def _sat_i16(x: np.int32, sat: np.int16) -> np.int16:
     s = np.int32(sat)
@@ -33,6 +34,7 @@ def _add_sat_i16(a: np.int16, b: np.int16, sat: np.int16) -> np.int16:
 @njit(nogil=True, fastmath=True, inline="always")
 def _sub_sat_i16(a: np.int16, b: np.int16) -> np.int16:
     return _sat_i16(np.int32(a) - np.int32(b), np.int16(32767))
+    # LOC80-END PY_STD
 
 
 @njit(nogil=True, fastmath=True, inline="always")
@@ -343,6 +345,7 @@ def _step_layered_spa_f32(
 
 
 # 4a. Horizontal Layered + OMS (Float32)
+# LOC80-BEGIN PY_STD
 @njit(nogil=True, fastmath=True, inline="always")
 def _step_layered_oms_f32(
     chk_offsets: np.ndarray,
@@ -454,12 +457,14 @@ def _step_layered_oms_i16(
                 new_msg = _sat_i16(np.int32(res), sat_val)
                 msg[k, w] = new_msg
                 vn[u, w] = _add_sat_i16(v_val, new_msg, sat_val)
+                # LOC80-END PY_STD
 
 
 # ====================================================================================================
 # TOP-LEVEL ENTRY POINTS (`decode_siho_std_f32` / `decode_siho_std_i16`)
 # ====================================================================================================
 
+# LOC80-BEGIN PY_STD
 @njit(nogil=True, fastmath=True)
 def decode_siho_std_f32(
     var_offsets: np.ndarray,
@@ -503,6 +508,7 @@ def decode_siho_std_f32(
     valid = True
     ite_done = 0
     for ite in range(1, n_ite + 1):
+    # LOC80-END PY_STD
         if not is_layered:
             _update_var_nodes_f32(var_offsets, Y_N_buf, c2v, v2c, post, min1_w, True)
             if not is_oms:
@@ -513,7 +519,9 @@ def decode_siho_std_f32(
             if not is_oms:
                 _step_layered_spa_f32(chk_offsets, chk_to_var, post, c2v, vals, contrib, sng_w, prd_w, nz_w)
             else:
+                # LOC80-BEGIN PY_STD
                 _step_layered_oms_f32(chk_offsets, chk_to_var, offset, post, c2v, contrib, sng_w, min1_w, min2_w, cst1_w, cst2_w)
+                # LOC80-END PY_STD
 
         if enable_syndrome and (is_layered or ite != n_ite):
             if not is_layered:
@@ -530,12 +538,15 @@ def decode_siho_std_f32(
     if not is_layered and ite_done == n_ite:
         _update_var_nodes_f32(var_offsets, Y_N_buf, c2v, v2c, post, min1_w, False)
 
+    # LOC80-BEGIN PY_STD
     for w in range(W):
         for i in range(K):
             V_K_wave[w, i] = np.int32(1) if post[info_bits_pos[i], w] < np.float32(0.0) else np.int32(0)
     return 0 if valid else 1
+    # LOC80-END PY_STD
 
 
+# LOC80-BEGIN PY_STD
 @njit(nogil=True, fastmath=True)
 def decode_siho_std_i16(
     var_offsets: np.ndarray,
@@ -576,11 +587,14 @@ def decode_siho_std_i16(
     valid = True
     ite_done = 0
     for ite in range(1, n_ite + 1):
+    # LOC80-END PY_STD
         if not is_layered:
             _update_var_nodes_i16(var_offsets, Y_N_buf, c2v, v2c, post, min1_w, True)
             _step_flooding_oms_i16(chk_offsets, transpose, offset, sat_val, v2c, c2v, sng_w, min1_w, min2_w, cst1_w, cst2_w)
         else:
+            # LOC80-BEGIN PY_STD
             _step_layered_oms_i16(chk_offsets, chk_to_var, offset, sat_val, post, c2v, contrib, sng_w, min1_w, min2_w, cst1_w, cst2_w)
+            # LOC80-END PY_STD
 
         if enable_syndrome and (is_layered or ite != n_ite):
             if not is_layered:
@@ -597,10 +611,12 @@ def decode_siho_std_i16(
     if not is_layered and ite_done == n_ite:
         _update_var_nodes_i16(var_offsets, Y_N_buf, c2v, v2c, post, min1_w, False)
 
+    # LOC80-BEGIN PY_STD
     for w in range(W):
         for i in range(K):
             V_K_wave[w, i] = np.int16(1) if post[info_bits_pos[i], w] < np.int16(0) else np.int16(0)
     return 0 if valid else 1
+    # LOC80-END PY_STD
 
 
 # Ahead-of-execution compilation for Float32 and Int16 entry points (mirroring Julia `precompile(...)`)

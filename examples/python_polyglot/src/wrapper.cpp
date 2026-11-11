@@ -20,6 +20,9 @@
 #include <aff3ct.hpp>
 #include <streampu.hpp>
 
+#include "ldpc_spec/Decoder_LDPC_spec.hpp"
+#include "rx_chain/Antenna_replay.hpp"
+
 namespace py = pybind11;
 using namespace py::literals;
 
@@ -549,6 +552,29 @@ class LDPC_Code
         dec_params.syndrome_depth = syndrome_depth;
         return dec_params.build<int16_t, int16_t>(this->H_, this->info_bits_pos_);
     }
+
+    // --- Specialized hand-written C++ decoders (BP horizontal layered + OMS, flat tables, intrinsics) ---
+    aff3ct::module::Decoder_SIHO<int, float>* build_decoder_spec(const int n_ite = 10,
+                                                                 const std::string& simd_strategy = "",
+                                                                 const float offset = 0.15f) const
+    {
+        return new Decoder_LDPC_spec<int, float>(
+          this->K_, this->N_cw_, n_ite, this->H_, this->info_bits_pos_, offset, 0.f, simd_strategy == "INTER");
+    }
+
+    aff3ct::module::Decoder_SIHO<int16_t, int16_t>* build_decoder_spec_i16(const int n_ite = 10,
+                                                                           const std::string& simd_strategy = "",
+                                                                           const float offset = 1.0f) const
+    {
+        return new Decoder_LDPC_spec<int16_t, int16_t>(this->K_,
+                                                        this->N_cw_,
+                                                        n_ite,
+                                                        this->H_,
+                                                        this->info_bits_pos_,
+                                                        (int16_t)offset,
+                                                        this->sat_val_i16_,
+                                                        simd_strategy == "INTER");
+    }
 };
 
 using Monitor_BFER_int = aff3ct::module::Monitor_BFER<int>;
@@ -691,6 +717,12 @@ PYBIND11_MODULE(py_aff3ct, m, py::mod_gil_not_used())
       "Return the native SIMD register width in elements for int16_t.");
 
     m.def(
+      "spec_simd_width_f32", []() { return ldpc_spec::simd_width<float>(); }, "SIMD lanes of the specialized decoder (f32).");
+    m.def(
+      "spec_simd_width_i16", []() { return ldpc_spec::simd_width<int16_t>(); }, "SIMD lanes of the specialized decoder (i16).");
+    m.def("spec_isa", []() { return ldpc_spec_isa_name(); }, "ISA used by the specialized decoder.");
+
+    m.def(
       "set_single_wave",
       [](spu::module::Module& mdl, const bool enable)
       {
@@ -710,6 +742,23 @@ PYBIND11_MODULE(py_aff3ct, m, py::mod_gil_not_used())
       .def("set_sigma", &Sigma_buffer::set_sigma, "sigma"_a)
       .def("get_sigma", &Sigma_buffer::get_sigma)
       .def("bind", &Sigma_buffer::bind, "socket"_a);
+
+    // --- Antenna_replay (receiver-only benchmark chain: replays pre-generated noisy frames) ---
+    py::class_<Antenna_replay<int, float>, spu::module::Stateful>(m, "Antenna_replay")
+      .def(py::init<const size_t, const size_t, const size_t>(), "K"_a, "N"_a, "buffer_bytes"_a = size_t(64) << 20)
+      .def("fill", &Antenna_replay<int, float>::fill, "tx_tasks"_a, py::call_guard<py::gil_scoped_release>(),
+           "Fill the ring buffer by executing the bound transmitter tasks (+ record) until full.")
+      .def("rewind", &Antenna_replay<int, float>::rewind)
+      .def("get_n_buf", &Antenna_replay<int, float>::get_n_buf)
+      .def("get_buffer_bytes", &Antenna_replay<int, float>::get_buffer_bytes);
+
+    py::class_<Antenna_replay<int16_t, float>, spu::module::Stateful>(m, "Antenna_replay_i16")
+      .def(py::init<const size_t, const size_t, const size_t>(), "K"_a, "N"_a, "buffer_bytes"_a = size_t(64) << 20)
+      .def("fill", &Antenna_replay<int16_t, float>::fill, "tx_tasks"_a, py::call_guard<py::gil_scoped_release>(),
+           "Fill the ring buffer by executing the bound transmitter tasks (+ record) until full.")
+      .def("rewind", &Antenna_replay<int16_t, float>::rewind)
+      .def("get_n_buf", &Antenna_replay<int16_t, float>::get_n_buf)
+      .def("get_buffer_bytes", &Antenna_replay<int16_t, float>::get_buffer_bytes);
 
     // --- Source_random_fast (32-bit and 16-bit) ---
     py::class_<Source_random_fast_any<int>, spu::module::Source<int>>(m, "Source_random_fast")
@@ -911,6 +960,18 @@ PYBIND11_MODULE(py_aff3ct, m, py::mod_gil_not_used())
            "n_decimals"_a = 2,
            "n_bits"_a = 8,
            py::return_value_policy::take_ownership)
+      .def("build_decoder_spec",
+           &LDPC_Code::build_decoder_spec,
+           "n_ite"_a = 10,
+           "simd_strategy"_a = "",
+           "offset"_a = 0.15f,
+           py::return_value_policy::take_ownership)
+      .def("build_decoder_spec_i16",
+           &LDPC_Code::build_decoder_spec_i16,
+           "n_ite"_a = 10,
+           "simd_strategy"_a = "",
+           "offset"_a = 1.0f,
+           py::return_value_policy::take_ownership)
       .def("build_decoder_i16",
            &LDPC_Code::build_decoder_i16,
            "type"_a = "BP_FLOODING",
@@ -1111,6 +1172,57 @@ PYBIND11_MODULE(py_aff3ct, m, py::mod_gil_not_used())
       "max_frame"_a = 0,
       "n_frames"_a = 1,
       "Execute a 3-stage Pipeline (int16) until monitor/frame limit is reached and return elapsed time in microseconds.");
+
+    // Receiver-only chain (no Source module in the pipeline): stop on the frame count or the monitor FE limit.
+    m.def(
+      "exec_pipeline_rx",
+      [](spu::runtime::Pipeline& pipe, Monitor_BFER_int& mnt, const size_t max_frame, const size_t n_frames) -> double
+      {
+          py::gil_scoped_release release{};
+          const auto t_start = std::chrono::steady_clock::now();
+          size_t generated_fra = 0;
+          mnt.disable_is_done(true);
+          pipe.exec(std::vector<std::function<bool()>>{
+            [&]() -> bool
+            {
+                generated_fra += n_frames;
+                return generated_fra >= max_frame || mnt.fe_limit_achieved();
+            },
+            [&]() -> bool { return mnt.fe_limit_achieved(); },
+            [&]() -> bool { return mnt.fe_limit_achieved(); } });
+          const auto t_stop = std::chrono::steady_clock::now();
+          return std::chrono::duration<double, std::micro>(t_stop - t_start).count();
+      },
+      "pipeline"_a,
+      "monitor"_a,
+      "max_frame"_a,
+      "n_frames"_a = 1,
+      "Execute a receiver-only 3-stage Pipeline (int32) and return elapsed time in microseconds.");
+
+    m.def(
+      "exec_pipeline_rx_i16",
+      [](spu::runtime::Pipeline& pipe, Monitor_BFER_i16& mnt, const size_t max_frame, const size_t n_frames) -> double
+      {
+          py::gil_scoped_release release{};
+          const auto t_start = std::chrono::steady_clock::now();
+          size_t generated_fra = 0;
+          mnt.disable_is_done(true);
+          pipe.exec(std::vector<std::function<bool()>>{
+            [&]() -> bool
+            {
+                generated_fra += n_frames;
+                return generated_fra >= max_frame || mnt.fe_limit_achieved();
+            },
+            [&]() -> bool { return mnt.fe_limit_achieved(); },
+            [&]() -> bool { return mnt.fe_limit_achieved(); } });
+          const auto t_stop = std::chrono::steady_clock::now();
+          return std::chrono::duration<double, std::micro>(t_stop - t_start).count();
+      },
+      "pipeline"_a,
+      "monitor"_a,
+      "max_frame"_a,
+      "n_frames"_a = 1,
+      "Execute a receiver-only 3-stage Pipeline (int16) and return elapsed time in microseconds.");
 
     m.def(
       "thread_pinning_init",

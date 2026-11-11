@@ -30,18 +30,21 @@ Initialize all Git submodules from the root of `my_project_with_aff3ct`, and syn
 # From the root of my_project_with_aff3ct:
 git submodule update --init --recursive
 
-# Align AFF3CT's StreamPU submodule with the newer StreamPU version in pyStreamPU:
-git -C lib/aff3ct/lib/streampu fetch ../../pystreampu/lib/streampu
-git -C lib/aff3ct/lib/streampu checkout $(git -C lib/pystreampu/lib/streampu rev-parse HEAD)
+# Build AFF3CT with the StreamPU of pyStreamPU (the AFF3CT submodule itself is not updated: only its
+# lib/streampu working copy is moved to the pyStreamPU commit, detached HEAD):
+./scripts/use_pystreampu_streampu.sh
 ```
+
+`git status` then shows `lib/aff3ct` as modified: this is expected, do **not** commit it. A later
+`git submodule update --recursive` restores the StreamPU commit recorded by AFF3CT: run the script again, then
+rebuild Steps 1 to 3 below.
 
 > [!IMPORTANT]
 > **Single Shared `StreamPU` ABI Rule:**
 > Because `pyStreamPU` (`streampu`) and `py_aff3ct` exchange C++ pointers (`spu::module::Module`, `spu::runtime::Sequence`, `spu::runtime::Pipeline`, `spu::runtime::Task`, `spu::runtime::Socket`) inside the same Python process, **both extensions must be compiled against the exact same `StreamPU` headers and library installed in `aff3ct_install/`** (`INCLUDE_SPU_LIB=OFF`).
 > The commands above ensure that `lib/aff3ct` builds and installs the exact `StreamPU` commit expected by `lib/pystreampu`. You can verify at any time that both point to the same commit with:
 > ```bash
-> git -C lib/pystreampu/lib/streampu rev-parse HEAD
-> git -C lib/aff3ct/lib/streampu rev-parse HEAD
+> ./scripts/use_pystreampu_streampu.sh --check
 > ```
 
 ---
@@ -65,7 +68,8 @@ cmake .. -G"Unix Makefiles" \
          -DAFF3CT_COMPILE_SHARED_LIB="ON" \
          -DSPU_COMPILE_STATIC_LIB="ON" \
          -DSPU_COMPILE_SHARED_LIB="ON" \
-         -DSPU_LINK_JULIA="ON"
+         -DSPU_LINK_JULIA="ON" \
+         -DSPU_LINK_HWLOC="ON"   # required by --sim-pin-threads (otherwise pinning is silently a no-op)
 cmake --build . -j 8
 cmake --install . --prefix ../../../aff3ct_install
 ln -sfn ../../../aff3ct_install/lib/cmake/aff3ct-* ../../../aff3ct_install/lib/cmake/aff3ct

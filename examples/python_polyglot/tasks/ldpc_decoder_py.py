@@ -23,6 +23,7 @@ import py_aff3ct
 # 1. PURE VECTORIZED NUMPY IMPLEMENTATION (Single-Frame and Inter-Frame `W` via 2D Array Broadcasting)
 # ====================================================================================================
 
+# LOC80-BEGIN PY_NUMPY
 def _numpy_decode_layered(mdl, Y_N_wave, V_K_wave):
     """Vectorized NumPy Horizontal-Layered BP decoder (processes all frames in `Y_N_wave` simultaneously)."""
     W = Y_N_wave.shape[0]
@@ -30,8 +31,10 @@ def _numpy_decode_layered(mdl, Y_N_wave, V_K_wave):
     chk_offsets = mdl.chk_offsets
     chk_to_var = mdl.chk_to_var
     n_chk = len(chk_offsets) - 1
+    # LOC80-END PY_NUMPY
     max_tanh = np.float32(1.0) - np.float32(np.finfo(np.float32).eps)
 
+    # LOC80-BEGIN PY_NUMPY
     var_nodes = Y_N_wave.T.copy()  # shape (N_cw, W)
     messages = np.zeros((mdl.n_branches, W), dtype=var_nodes.dtype)
 
@@ -70,7 +73,9 @@ def _numpy_decode_layered(mdl, Y_N_wave, V_K_wave):
             else:
                 contrib = var_nodes[u_idx] - messages[k_start:k_stop]
                 abs_c = np.abs(contrib)
+                # LOC80-END PY_NUMPY
                 if mdl.dec_implem == "OMS":
+                    # LOC80-BEGIN PY_NUMPY
                     sgn_c = contrib < np.float32(0.0)
                     tot_sgn = np.bitwise_xor.reduce(sgn_c, axis=0)
                     part = np.partition(abs_c, 1, axis=0)
@@ -81,6 +86,7 @@ def _numpy_decode_layered(mdl, Y_N_wave, V_K_wave):
                     res_abs = np.where(abs_c == min1, cst1, cst2)
                     res_sng = np.bitwise_xor(tot_sgn, sgn_c)
                     new_msg = np.where(res_sng, -res_abs, res_abs)
+                    # LOC80-END PY_NUMPY
                 else:
                     vals = np.tanh(abs_c * np.float32(0.5))
                     is_z = vals == np.float32(0.0)
@@ -96,8 +102,10 @@ def _numpy_decode_layered(mdl, Y_N_wave, V_K_wave):
                     new_msg = np.where(res_sng, -res_abs, res_abs)
                     active = (n_zeros == 0) | ((n_zeros == 1) & is_z)
                     new_msg = np.where(active, new_msg, np.float32(0.0))
+                # LOC80-BEGIN PY_NUMPY
                 messages[k_start:k_stop] = new_msg
                 var_nodes[u_idx] = contrib + new_msg
+                # LOC80-END PY_NUMPY
 
         if mdl.enable_syndrome:
             synd_ok = True
@@ -113,9 +121,11 @@ def _numpy_decode_layered(mdl, Y_N_wave, V_K_wave):
             if valid_synd:
                 break
 
+    # LOC80-BEGIN PY_NUMPY
     out_dtype = np.int16 if is_i16 else np.int32
     V_K_wave[:] = (var_nodes[mdl.info_bits_pos].T < 0).astype(out_dtype)
     return 0 if valid_synd else 1
+    # LOC80-END PY_NUMPY
 
 
 def _numpy_decode_flooding(mdl, Y_N_wave, V_K_wave):
@@ -244,6 +254,7 @@ def _numpy_decode_flooding(mdl, Y_N_wave, V_K_wave):
 # 2. STREAMPU `Stateful_core` MODULE (`DecoderLDPCPython`)
 # ====================================================================================================
 
+# LOC80-BEGIN PY.module
 class DecoderLDPCPython(spu.Stateful_core):
     """Generic LDPC BP Decoder in Python (`NumPy` or `Numba` tiers `naive`/`std`/`opt`) as a StreamPU `Stateful_core` module."""
 
@@ -321,18 +332,28 @@ class DecoderLDPCPython(spu.Stateful_core):
             )
         else:
             self.create_codelet(task, DecoderLDPCPython._decode_numpy)
+            # LOC80-END PY.module
 
+    # LOC80-BEGIN PY_NUMBA.module
     def _resolve_numba_kernel(self):
         if self.is_i16 and not self.is_oms and self.py_tier != "naive":
             raise ValueError("SPA in 16-bit fixed-point (i16) is only supported in naive tier; use OMS for i16.")
+            # LOC80-END PY_NUMBA.module
+        # LOC80-BEGIN PY_NAIVE.module
         if self.py_tier == "naive":
             from . import ldpc_bp_naive
             return ldpc_bp_naive.decode_siho_naive_i16 if self.is_i16 else ldpc_bp_naive.decode_siho_naive_f32
+            # LOC80-END PY_NAIVE.module
+        # LOC80-BEGIN PY_STD.module
         if self.py_tier == "std":
             from . import ldpc_bp_std
             return ldpc_bp_std.decode_siho_std_i16 if self.is_i16 else ldpc_bp_std.decode_siho_std_f32
+            # LOC80-END PY_STD.module
+        # LOC80-BEGIN PY_OPT.module
         if self.py_tier in ("opt", "numba"):
             from . import ldpc_bp_opt, ldpc_bp_std
+            # LOC80-END PY_OPT.module
+            # LOC80-BEGIN PY_OPT_INTER.module
             if self.single_wave:
                 W = self._work_W
                 if self.is_i16:
@@ -351,9 +372,22 @@ class DecoderLDPCPython(spu.Stateful_core):
                     if W == 16:
                         return ldpc_bp_opt.decode_siho_opt_inter_f32_w16
                     return ldpc_bp_std.decode_siho_std_f32
+                    # LOC80-END PY_OPT_INTER.module
+            # LOC80-BEGIN PY_OPT_SCALAR.module
             return ldpc_bp_opt.decode_siho_opt_scalar_i16 if self.is_i16 else ldpc_bp_opt.decode_siho_opt_scalar_f32
+            # LOC80-END PY_OPT_SCALAR.module
+        # LOC80-BEGIN PY_IDIOM_INTER.module
+        if self.py_tier == "idiom":
+            if not (self.is_layered and self.is_oms) or self.enable_syndrome:
+                raise ValueError("The idiom tier only supports BP_HORIZONTAL_LAYERED + OMS with --dec-no-synd.")
+            from . import ldpc_bp_idiom
+            return ldpc_bp_idiom.decode_siho_idiom_i16 if self.is_i16 else ldpc_bp_idiom.decode_siho_idiom_f32
+            # LOC80-END PY_IDIOM_INTER.module
+        # LOC80-BEGIN PY_NUMBA.module
         raise ValueError(f"Unknown Python/Numba LDPC tier: {self.py_tier}")
+        # LOC80-END PY_NUMBA.module
 
+    # LOC80-BEGIN PY.module
     def _allocate_workspace(self, W: int):
         dtype = np.int16 if self.is_i16 else np.float32
         W = max(1, int(W))
@@ -379,11 +413,15 @@ class DecoderLDPCPython(spu.Stateful_core):
         self.prod_w = np.zeros(W, dtype=np.float32)
         self.nzeros_w = np.zeros(W, dtype=np.int32)
         self.synd_w = np.zeros(W, dtype=np.uint8)
+        # LOC80-END PY.module
 
+    # LOC80-BEGIN PY_NUMBA.module
     def _get_numba_extra_args(self, W: int):
         if W != self._work_W:
             self._allocate_workspace(W)
+            # LOC80-END PY_NUMBA.module
 
+        # LOC80-BEGIN PY_NAIVE.module
         if self.py_tier == "naive":
             if self.is_i16:
                 return (
@@ -398,7 +436,20 @@ class DecoderLDPCPython(spu.Stateful_core):
                 np.int32(self.n_ite), self.enable_syndrome, np.int32(self.syndrome_depth),
                 self.msg_chk_to_var, self.msg_var_to_chk, self.post,
             )
+            # LOC80-END PY_NAIVE.module
 
+        # LOC80-BEGIN PY_IDIOM_INTER.module
+        if self.py_tier == "idiom":
+            offset = np.int16(self.offset) if self.is_i16 else np.float32(self.offset)
+            sat = (self.sat_val_i16,) if self.is_i16 else ()
+            return (
+                self.chk_offsets, self.chk_to_var, self.info_bits_pos, offset, *sat, np.int32(self.n_ite),
+                self.post_inter, self.msg_chk_to_var_inter, self.contrib_inter,
+                self.sign_w, self.min1_w, self.min2_w, self.cst1_w, self.cst2_w,
+            )
+            # LOC80-END PY_IDIOM_INTER.module
+
+        # LOC80-BEGIN PY_OPT_INTER.module
         if self.py_tier in ("opt", "numba") and self.single_wave:
             if self.is_i16 and W in (8, 16, 32):
                 return (
@@ -416,7 +467,9 @@ class DecoderLDPCPython(spu.Stateful_core):
                     self.Y_N_inter, self.post_inter, self.msg_chk_to_var_inter, self.msg_var_to_chk_inter,
                     self.values_inter, self.contrib_inter,
                 )
+                # LOC80-END PY_OPT_INTER.module
 
+        # LOC80-BEGIN PY_STD.module
         if self.py_tier == "std" or self.single_wave:
             if self.is_i16:
                 return (
@@ -434,7 +487,9 @@ class DecoderLDPCPython(spu.Stateful_core):
                 self.values_inter, self.contrib_inter,
                 self.sign_w, self.min1_w, self.min2_w, self.cst1_w, self.cst2_w, self.prod_w, self.nzeros_w, self.synd_w,
             )
+            # LOC80-END PY_STD.module
 
+        # LOC80-BEGIN PY_OPT_SCALAR.module
         # `opt` Scalar mode (`W == 1`)
         if self.is_i16:
             return (
@@ -449,6 +504,7 @@ class DecoderLDPCPython(spu.Stateful_core):
             np.int32(self.n_ite), self.enable_syndrome, np.int32(self.syndrome_depth),
             self.post, self.msg_chk_to_var, self.msg_var_to_chk, self.values, self.contrib,
         )
+        # LOC80-END PY_OPT_SCALAR.module
 
     def _run_numba_wave(self, Y_N_wave, V_K_wave):
         args = self._get_numba_extra_args(Y_N_wave.shape[0])
@@ -458,12 +514,15 @@ class DecoderLDPCPython(spu.Stateful_core):
     def _decode_numba(mdl, tsk, frame_id):
         return mdl._run_numba_wave(tsk["Y_N"].wave, tsk["V_K"].wave)
 
+    # LOC80-BEGIN PY_NUMPY.module
     @staticmethod
     def _decode_numpy(mdl, tsk, frame_id):
         if mdl.is_layered:
             return _numpy_decode_layered(mdl, tsk["Y_N"].wave, tsk["V_K"].wave)
         return _numpy_decode_flooding(mdl, tsk["Y_N"].wave, tsk["V_K"].wave)
+        # LOC80-END PY_NUMPY.module
 
+    # LOC80-BEGIN PY.module
     def clone(self):
         other = type(self).__new__(type(self))
         spu.Stateful_core.__init__(other, self)
@@ -496,3 +555,4 @@ class DecoderLDPCPython(spu.Stateful_core):
         # Allocate independent per-thread workspace buffers
         other._allocate_workspace(self._work_W)
         return other
+        # LOC80-END PY.module
