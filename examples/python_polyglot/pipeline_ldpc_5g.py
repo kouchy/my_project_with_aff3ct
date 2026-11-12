@@ -168,8 +168,12 @@ def parse_args():
                         "the noisy frames are generated once by the transmitter and replayed from a ring buffer")
     p.add_argument("--mod", type=str, default="BPSK", choices=["BPSK", "QAM16", "QAM64", "QAM256"],
                    help="Modulation (5G NR PUSCH: QPSK..256QAM; square Gray QAM from AFF3CT's Constellation_QAM)")
-    p.add_argument("--demod", type=str, default="LOGMAP", choices=["LOGMAP", "MAXLOG"],
-                   help="QAM demodulation: exact log-MAP (log-sum-exp over the constellation) or max-log")
+    p.add_argument("--demod", type=str, default="LOGMAP", choices=["LOGMAP", "LINEAR", "MAXLOG"],
+                   help="QAM demodulation: exact log-MAP (log-sum-exp over the constellation), LINEAR (max-log + "
+                        "piecewise-linear correction, no exp/log) or max-log")
+    p.add_argument("--demod-julia", action="store_true",
+                   help="Mixed-language receiver: Julia QAM demodulator (ldpc_5g_julia/src/demod_qam.jl) followed by "
+                        "the decoder in the replicated stage")
     p.add_argument("--demod-numba", action="store_true",
                    help="Mixed-language receiver: Python/Numba demodulator followed by the decoder in the replicated "
                         "stage (instead of the C++ AFF3CT demodulator)")
@@ -289,7 +293,7 @@ def main():
         def make_modem(n, i16):
             if bps == 1:
                 return py_aff3ct.Modem_BPSK_fast_i16(n) if i16 else py_aff3ct.Modem_BPSK_fast(n)
-            name = ("Modem_QAM_logmap" if args.demod == "LOGMAP" else "Modem_QAM_maxlog") + ("_i16" if i16 else "")
+            name = "Modem_QAM_" + args.demod.lower() + ("_i16" if i16 else "")
             return getattr(py_aff3ct, name)(n, bps)
 
         # Instantiate C++ / Julia / Python modules
@@ -399,13 +403,36 @@ def main():
 
     # receiver demodulator: C++ (AFF3CT) or Python/Numba (mixed-language receiver stage)
     dem = modem
-    if args.demod_numba:
+    if args.demod_julia:
+        if bps == 1:
+            raise ValueError("--demod-julia is implemented for QAM only")
+        import numpy as np
+        if not jl_dec:
+            spu.julia.init()
+        c_re, c_im = py_aff3ct.qam_constellation(bps)
+        lit = lambda v: "Float32[" + ", ".join(f"{np.float32(x)}f0" for x in v) + "]"
+        algo = {"MAXLOG": 0, "LINEAR": 1, "LOGMAP": 2}[args.demod]
+        dem = spu.Stateful_Julia(jl_safe=False)
+        dem.name = f"Modem_QAM{1 << bps}_{args.demod.lower()}_demodulate_Julia"
+        py_aff3ct.set_single_wave(dem, True)
+        jl_demod = os.path.normpath(os.path.join(HERE, "..", "ldpc_5g_julia", "src", "demod_qam.jl"))
+        dem.create_state_file(f"QAMDemod({lit(c_re)}, {lit(c_im)}, {bps}, {algo})", jl_demod, shared=False)
+        tdem = dem.create_task("demodulate")
+        tdem.replicable = True
+        dem.create_socket_in(tdem, "CP", 1, spu.float32)
+        dem.create_socket_in(tdem, "Y_N1", N_mod, spu.float32)
+        dem.create_socket_out(tdem, "Y_N2", N, spu.float32)
+        dem.create_codelet(tdem, function_name="demod_qam_julia")
+        dem.n_frames = n_frames
+        dem.eval()
+        dec_desc = f"Julia {args.mod} {args.demod} demodulator + " + dec_desc
+    elif args.demod_numba:
         if bps == 1:
             from tasks.demod_numba import DemodBPSKNumba
             dem = DemodBPSKNumba(N)
         else:
             from tasks.demod_qam_numba import DemodQAMNumba
-            dem = DemodQAMNumba(N, bps, args.demod == "LOGMAP")
+            dem = DemodQAMNumba(N, bps, args.demod)
         dec_desc = f"Python/Numba {args.mod} demodulator + " + dec_desc
     elif bps > 1:
         dec_desc = f"C++ {args.mod} {args.demod} demodulator + " + dec_desc

@@ -34,6 +34,7 @@ namespace
 // (clones keep referring to the constellation of the original module, which lives as long as the pipeline).
 // MAX = aff3ct::tools::max_star -> exact log-MAP demodulation (log-sum-exp over the constellation points),
 // MAX = aff3ct::tools::max      -> max-log approximation.
+// MAX = aff3ct::tools::max_linear -> max-log + piecewise-linear correction (no transcendental function).
 struct QAM_constellation_holder
 {
     aff3ct::tools::Constellation_QAM<float> owned_cstl;
@@ -826,6 +827,12 @@ PYBIND11_MODULE(py_aff3ct, m, py::mod_gil_not_used())
                                                                                                "Modem_QAM_logmap_i16")
       .def(py::init<const int, const unsigned>(), "N"_a, "bps"_a = 4);
     py::class_<Modem_QAM_owned<int16_t, aff3ct::tools::max<float>>, spu::module::Stateful>(m, "Modem_QAM_maxlog_i16")
+      .def(py::init<const int, const unsigned>(), "N"_a, "bps"_a = 4);
+    // max_linear: max(a, b) + max(0, 0.301 - |a - b| / 2), piecewise-linear approximation of the log-MAP correction
+    py::class_<Modem_QAM_owned<int, aff3ct::tools::max_linear<float>>, spu::module::Stateful>(m, "Modem_QAM_linear")
+      .def(py::init<const int, const unsigned>(), "N"_a, "bps"_a = 4);
+    py::class_<Modem_QAM_owned<int16_t, aff3ct::tools::max_linear<float>>, spu::module::Stateful>(m,
+                                                                                                "Modem_QAM_linear_i16")
       .def(py::init<const int, const unsigned>(), "N"_a, "bps"_a = 4);
     m.def(
       "qam_constellation",

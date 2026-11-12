@@ -32,3 +32,4 @@ scripts/abi/db_summary.txt
 
 __pycache__/
 cmake/
+aff3ct_install/

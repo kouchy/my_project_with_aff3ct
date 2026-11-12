@@ -5,7 +5,8 @@ for each bit b of each received symbol y,
 
     LLR_b = MAX_{j : bit b of j = 0} ( -|y - c_j|^2 / (2 sigma^2) )  -  MAX_{j : bit b of j = 1} ( ... )
 
-with MAX = max* (exact log-MAP: max(a, b) + log1p(exp(-|a - b|))) or max (max-log approximation), the points c_j
+with MAX = max* (exact log-MAP: max(a, b) + log1p(exp(-|a - b|))), max_linear (max(a, b) + max(0, 0.301 - |a - b|/2),
+piecewise-linear correction, no transcendental function) or max (max-log approximation), the points c_j
 being AFF3CT's own constellation (`py_aff3ct.qam_constellation`), visited in the same order (j = 0 .. M-1) and in
 float32, as in the C++ implementation. Attached through `create_codelet`, the `@njit` kernel is compiled into a
 C-callable trampoline and invoked by the native worker threads without the Python interpreter or the GIL.
@@ -20,7 +21,7 @@ import streampu as spu
 _SIG = (types.float32[:, ::1], types.float32[:, ::1], types.float32[:, ::1])
 
 
-def _make_kernel(bps: int, logmap: bool):
+def _make_kernel(bps: int, algo: str):
     re, im = py_aff3ct.qam_constellation(bps)
     c_re = np.asarray(re, dtype=np.float32)
     c_im = np.asarray(im, dtype=np.float32)
@@ -28,12 +29,23 @@ def _make_kernel(bps: int, logmap: bool):
     BPS = bps
     NINF = np.float32(-np.inf)
 
-    if logmap:
+    if algo == "LOGMAP":
 
         @njit(nogil=True, fastmath=False, inline="always")
         def vmax(a, b):
             m = a if a >= b else b
             return np.float32(m + np.log1p(np.exp(-np.abs(np.float32(a - b)))))
+
+    elif algo == "LINEAR":
+        C0 = np.float32(0.301)
+        HALF = np.float32(0.5)
+        ZERO = np.float32(0.0)
+
+        @njit(nogil=True, fastmath=False, inline="always")
+        def vmax(a, b):
+            m = a if a >= b else b
+            c = np.float32(C0 - np.float32(HALF * np.abs(np.float32(a - b))))
+            return np.float32(m + (c if c > ZERO else ZERO))
 
     else:
 
@@ -81,14 +93,16 @@ _KERNELS = {}
 class DemodQAMNumba(spu.Stateful_core):
     """Numba QAM demodulator task `demodulate` (sockets CP, Y_N1 [2*ceil(N/bps) floats], Y_N2 [N LLRs])."""
 
-    def __init__(self, N: int, bps: int = 4, logmap: bool = True):
+    def __init__(self, N: int, bps: int = 4, algo: str = "LOGMAP"):
         super().__init__()
-        self.N, self.bps, self.logmap = N, bps, logmap
+        if algo not in ("LOGMAP", "LINEAR", "MAXLOG"):
+            raise ValueError(f"unknown QAM demodulation '{algo}'")
+        self.N, self.bps, self.algo = N, bps, algo
         self.N_mod = 2 * ((N + bps - 1) // bps)
-        key = (bps, logmap)
+        key = (bps, algo)
         if key not in _KERNELS:
-            _KERNELS[key] = _make_kernel(bps, logmap)
-        self.name = f"Modem_QAM{1 << bps}_{'logmap' if logmap else 'maxlog'}_demodulate_Numba"
+            _KERNELS[key] = _make_kernel(bps, algo)
+        self.name = f"Modem_QAM{1 << bps}_{algo.lower()}_demodulate_Numba"
         py_aff3ct.set_single_wave(self, True)
         t = self.create_task("demodulate")
         t.replicable = True
@@ -100,6 +114,6 @@ class DemodQAMNumba(spu.Stateful_core):
     def clone(self):
         other = type(self).__new__(type(self))
         spu.Stateful_core.__init__(other, self)
-        other.N, other.bps, other.logmap, other.N_mod = self.N, self.bps, self.logmap, self.N_mod
+        other.N, other.bps, other.algo, other.N_mod = self.N, self.bps, self.algo, self.N_mod
         return other
 
