@@ -45,3 +45,8 @@ class DemodBPSKNumba(spu.Stateful_core):
         other.N = self.N
         return other
 
+
+
+def build_demod_bpsk_numba(N: int) -> DemodBPSKNumba:
+    """Build the Numba BPSK demodulator of `N` LLRs per frame."""
+    return DemodBPSKNumba(N)

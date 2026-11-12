@@ -428,11 +428,11 @@ def main():
         dec_desc = f"Julia {args.mod} {args.demod} demodulator + " + dec_desc
     elif args.demod_numba:
         if bps == 1:
-            from tasks.demod_numba import DemodBPSKNumba
-            dem = DemodBPSKNumba(N)
+            from tasks.demod_numba import build_demod_bpsk_numba
+            dem = build_demod_bpsk_numba(N)
         else:
-            from tasks.demod_qam_numba import DemodQAMNumba
-            dem = DemodQAMNumba(N, bps, args.demod)
+            from tasks.demod_qam_numba import build_demod_qam_numba
+            dem = build_demod_qam_numba(N, bps, args.demod)
         dec_desc = f"Python/Numba {args.mod} demodulator + " + dec_desc
     elif bps > 1:
         dec_desc = f"C++ {args.mod} {args.demod} demodulator + " + dec_desc

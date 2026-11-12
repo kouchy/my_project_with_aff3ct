@@ -186,9 +186,9 @@ def main():
 
     demod = None
     if args.mixed:
-        from tasks.demod_numba import DemodBPSKNumba
+        from tasks.demod_numba import build_demod_bpsk_numba
 
-        demod = DemodBPSKNumba(N_cw)
+        demod = build_demod_bpsk_numba(N_cw)
         dec_desc = "Python/Numba demodulator + " + dec_desc
 
     for mdl in (source, encoder, modem, channel, decoder, monitor, sink) + ((demod,) if demod is not None else ()):

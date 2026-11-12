@@ -117,3 +117,8 @@ class DemodQAMNumba(spu.Stateful_core):
         other.N, other.bps, other.algo, other.N_mod = self.N, self.bps, self.algo, self.N_mod
         return other
 
+
+
+def build_demod_qam_numba(N: int, bps: int = 4, algo: str = "LOGMAP") -> DemodQAMNumba:
+    """Build the Numba QAM demodulator (`algo`: LOGMAP, LINEAR or MAXLOG) of `N` LLRs per frame."""
+    return DemodQAMNumba(N, bps, algo)
