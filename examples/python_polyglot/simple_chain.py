@@ -404,19 +404,16 @@ def run_chain_once(
         for s in range(n_inc)
     ]
 
-    # Bind sockets
-    if fwd:
-        incs[0]["incrementf::fwd"] = initializer["initialize::out"]
-        for s in range(n_inc - 1):
-            incs[s + 1]["incrementf::fwd"] = incs[s]["incrementf::fwd"]
-        finalizer["finalize::in"] = incs[n_inc - 1]["incrementf::fwd"]
-    else:
-        incs[0]["increment::in"] = initializer["initialize::out"]
-        for s in range(n_inc - 1):
-            incs[s + 1]["increment::in"] = incs[s]["increment::out"]
-        finalizer["finalize::in"] = incs[n_inc - 1]["increment::out"]
-
-    sequence_chain = spu.Sequence(initializer["initialize"], n_threads)
+    # Describe the chain: inside the block, calling a task only binds its input socket (nothing is executed).
+    # A forward socket is not an output, so the data of `incrementf` is read back by name.
+    data_out = "fwd" if fwd else "out"
+    with spu.sequence(n_threads) as seq:
+        data = initializer.initialize()
+        for inc in incs:
+            inc[task_name](data)
+            data = inc[task_name][data_out]
+        finalizer.finalize(data)
+    sequence_chain = seq.sequence
     sequence_chain.n_frames = n_inter_frames
     sequence_chain.no_copy_mode = no_copy_mode
 
@@ -510,18 +507,11 @@ def run_chain_once(
         # Estimate per-task time when task timers are disabled
         avg_inc_ns = (elapsed_ms * 1e6) / (n_exec * (n_inc + 2))
 
-    # Unbind sockets cleanly (matching C++ binaries)
+    # Unbind sockets cleanly (matching C++ binaries): reset() unbinds a socket from its producer and its consumers
     sequence_chain.n_frames = 1
-    if fwd:
-        incs[0]["incrementf::fwd"].unbind(initializer["initialize::out"])
-        for s in range(n_inc - 1):
-            incs[s + 1]["incrementf::fwd"].unbind(incs[s]["incrementf::fwd"])
-        finalizer["finalize::in"].unbind(incs[n_inc - 1]["incrementf::fwd"])
-    else:
-        incs[0]["increment::in"].unbind(initializer["initialize::out"])
-        for s in range(n_inc - 1):
-            incs[s + 1]["increment::in"].unbind(incs[s]["increment::out"])
-        finalizer["finalize::in"].unbind(incs[n_inc - 1]["increment::out"])
+    for inc in incs:
+        inc[task_name]["fwd" if fwd else "in"].reset()
+    finalizer.finalize["in"].reset()
 
     return tests_passed, warmup_ms, elapsed_ms, avg_inc_ns
 

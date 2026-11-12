@@ -197,41 +197,29 @@ def main():
         for mdl in (antenna, modem_tx):
             mdl.n_frames = n_frames
 
-    # Bind task sockets in Python (Control Plane)
+    # Control Plane (Python). The noise level is read by the channel and the demodulator from a shared buffer.
     sigma_buf = py_aff3ct.Sigma_buffer(n_frames, 1.0)
+    dem = modem if demod is None else demod
+
+    # Sub-chains, called inside `spu.bind_only()` or the `spu.pipeline()` / `spu.sequence()` blocks below: there,
+    # calling a task only binds its input sockets and returns its output sockets (nothing is executed).
+    def transmit(u, mod=modem):
+        """encoder -> modulator -> AWGN channel."""
+        sigma_buf.bind(channel.add_noise["CP"])
+        return channel.add_noise(X_N=mod.modulate(X_N1=encoder.encode(U_K=u)))
+
+    def receive(y):
+        """demodulator -> decoder, returns the decoded bits V_K."""
+        sigma_buf.bind(dem.demodulate["CP"])
+        decoder.decode_siho(Y_N=dem.demodulate(Y_N1=y))
+        return decoder.decode_siho["V_K"]  # by name: the C++ decoders also output CWD
+
     if rx:
-        # transmitter -> antenna.record (fill phase, outside the pipeline)
-        encoder["encode::U_K"].bind(source["generate::out_data"])
-        modem_tx["modulate::X_N1"].bind(encoder["encode::X_N"])
-        channel["add_noise::X_N"].bind(modem_tx["modulate::X_N2"])
-        sigma_buf.bind(channel["add_noise::CP"])
-        antenna["record::U_K"].bind(source["generate::out_data"])
-        antenna["record::Y_N"].bind(channel["add_noise::Y_N"])
-        tx_tasks = [source["generate"], encoder["encode"], modem_tx["modulate"], channel["add_noise"]]
-        # receiver: antenna.receive -> demod -> decoder -> monitor
-        dem = modem if demod is None else demod
-        dem["demodulate::Y_N1"].bind(antenna["receive::Y_N"])
-        sigma_buf.bind(dem["demodulate::CP"])
-        decoder["decode_siho::Y_N"].bind(dem["demodulate::Y_N2"])
-        monitor["check_errors::U"].bind(antenna["receive::U_K"])
-        monitor["check_errors::V"].bind(decoder["decode_siho::V_K"])
-    else:
-        encoder["encode::U_K"].bind(source["generate::out_data"])
-        modem["modulate::X_N1"].bind(encoder["encode::X_N"])
-        channel["add_noise::X_N"].bind(modem["modulate::X_N2"])
-        sigma_buf.bind(channel["add_noise::CP"])
-        if demod is None:
-            modem["demodulate::Y_N1"].bind(channel["add_noise::Y_N"])
-            sigma_buf.bind(modem["demodulate::CP"])
-            decoder["decode_siho::Y_N"].bind(modem["demodulate::Y_N2"])
-        else:
-            demod["demodulate::Y_N1"].bind(channel["add_noise::Y_N"])
-            sigma_buf.bind(demod["demodulate::CP"])
-            decoder["decode_siho::Y_N"].bind(demod["demodulate::Y_N2"])
-        monitor["check_errors::U"].bind(source["generate::out_data"])
-        monitor["check_errors::V"].bind(decoder["decode_siho::V_K"])
-        sink["send_count::in_count"].bind(source["generate::out_count"])
-        sink["send_count::in_data"].bind(decoder["decode_siho::V_K"])
+        # transmitter -> antenna.record: described here, executed by antenna.fill() (outside the pipeline)
+        with spu.bind_only():
+            u, _ = source.generate()
+            antenna.record(U_K=u, Y_N=transmit(u, modem_tx))
+        tx_tasks = [source.generate, encoder.encode, modem_tx.modulate, channel.add_noise]
 
     eff_buf = args.sim_interstage_buf if args.sim_interstage_buf > 0 else max(4, 2 * n_threads)
 
@@ -250,46 +238,48 @@ def main():
     if args.sim_pin_threads:
         py_aff3ct.thread_pinning_init()
 
+    pin, o = args.sim_pin_threads, args.sim_pin_offset
     if args.sim_sequence:
-        runtime = spu.Sequence(
-            source["generate"],
-            n_threads,
-            thread_pinning=args.sim_pin_threads,
-            sequence_pinning_policy="; ".join(f"PU_{args.sim_pin_offset + i}" for i in range(n_threads)) if args.sim_pin_threads else "",
-        )
+        # the whole chain replicated on n_threads threads
+        policy = "; ".join(f"PU_{o + i}" for i in range(n_threads)) if pin else ""
+        with spu.sequence(n_threads, thread_pinning=pin, sequence_pinning_policy=policy) as seq:
+            u, count = source.generate()
+            v = receive(transmit(u))
+            monitor.check_errors(U=u, V=v)
+            sink.send_count(in_data=v, in_count=count)
+        runtime = seq.sequence
         cloned_monitors = runtime.get_cloned_modules(monitor)
         monitor_red = py_aff3ct.Monitor_BFER_reduction(cloned_monitors)
         monitor_red.set_reduce_frequency_ms(1)
         if args.sim_dot:
             runtime.export_dot(args.sim_dot)
     else:
-        pin_flags = [True, True, True] if args.sim_pin_threads else [False, False, False]
-        o = args.sim_pin_offset
-        pin_puids = [[o], list(range(o + 1, o + 1 + n_threads)), [o + 1 + n_threads]] if args.sim_pin_threads else []
-        if rx:
-            p_first, p_last = [antenna["receive"]], [monitor["check_errors"]]
-            p_stages = [
-                [[antenna["receive"]], [antenna["receive"]], []],
-                [[dem["demodulate"]], [decoder["decode_siho"]], []],
-                [[monitor["check_errors"]], [], []],
-            ]
-        else:
-            p_first, p_last = [source["generate"]], [monitor["check_errors"], sink["send_count"]]
-            p_stages = [
-                [[source["generate"]], [source["generate"]] if args.stage_split == "source" else [channel["add_noise"]], []],
-                [[encoder["encode"]] if args.stage_split == "source" else [(modem["demodulate"] if demod is None else demod["demodulate"])], [decoder["decode_siho"]], []],
-                [[monitor["check_errors"], sink["send_count"]], [], []],
-            ]
-        runtime = spu.Pipeline(
-            p_first,
-            p_last,
-            p_stages,
-            [1, n_threads, 1],
-            [eff_buf, eff_buf],
-            [args.sim_active_waiting, args.sim_active_waiting],
-            pin_flags,
-            pin_puids,
-        )
+        # 3 stages: [source (or replayed antenna) | replicated stage on n_threads | monitor], each thread pinned
+        # to its own core when --sim-pin-threads (o, o+1..o+t, o+t+1)
+        def stage(n, cores):
+            return spu.stage(n_threads=n, thread_pinning=pin, puids=list(cores) if pin else None)
+
+        with spu.pipeline(buffer_size=eff_buf, active_waiting=args.sim_active_waiting) as pipe:
+            if rx:
+                with stage(1, [o]):
+                    u, y = antenna.receive()
+                with stage(n_threads, range(o + 1, o + 1 + n_threads)):
+                    v = receive(y)
+                with stage(1, [o + 1 + n_threads]):
+                    monitor.check_errors(U=u, V=v)
+            else:
+                with stage(1, [o]):
+                    u, count = source.generate()
+                    if args.stage_split == "frontend":
+                        y = transmit(u)
+                with stage(n_threads, range(o + 1, o + 1 + n_threads)):
+                    if args.stage_split == "source":
+                        y = transmit(u)
+                    v = receive(y)
+                with stage(1, [o + 1 + n_threads]):
+                    monitor.check_errors(U=u, V=v)
+                    sink.send_count(in_data=v, in_count=count)
+        runtime = pipe.pipeline
         monitor_red = None
         if args.sim_dot:
             runtime.export_dot(args.sim_dot)
